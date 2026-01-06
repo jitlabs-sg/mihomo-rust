@@ -1,0 +1,130 @@
+# Test configuration for hybrid Rust/Go architecture
+# This config includes both Rust-native and Go-fallback proxies
+
+log-level: debug
+mode: rule
+
+inbound:
+  mixed:
+    listen: "127.0.0.1:7890"
+    udp: true
+
+external-controller: "127.0.0.1:9090"
+
+dns:
+  enable: true
+  nameserver:
+    - 8.8.8.8
+    - 8.8.4.4
+
+proxies:
+  # Tier 1 - Rust native protocols
+  - name: ss-node
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: password123
+
+  - name: vmess-node
+    type: vmess
+    server: example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000001
+    alterId: 0
+    cipher: auto
+    tls: true
+
+  - name: trojan-node
+    type: trojan
+    server: example.com
+    port: 443
+    password: trojan-password
+    sni: example.com
+    skip-cert-verify: false
+
+  - name: vless-node
+    type: vless
+    server: example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000002
+    tls: true
+    skip-cert-verify: false
+
+  - name: http-proxy
+    type: http
+    server: proxy.example.com
+    port: 8080
+    username: user
+    password: pass
+
+  - name: socks5-proxy
+    type: socks5
+    server: socks.example.com
+    port: 1080
+    username: user
+    password: pass
+
+  # Tier 2-3 - Go fallback protocols (will use Go mihomo)
+  - name: snell-node
+    type: snell
+    server: example.com
+    port: 44046
+    psk: snell-password
+    version: 3
+
+  - name: tuic-node
+    type: tuic
+    server: example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000003
+    password: tuic-password
+    alpn:
+      - h3
+
+  - name: wireguard-node
+    type: wireguard
+    server: example.com
+    port: 51820
+    private-key: YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NT0=
+    public-key: YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NT0=
+    ip: 10.0.0.2
+
+proxy-groups:
+  - name: Auto
+    type: select
+    proxies:
+      - ss-node
+      - vmess-node
+      - trojan-node
+      - vless-node
+      - http-proxy
+      - socks5-proxy
+      - snell-node
+      - tuic-node
+      - wireguard-node
+      - DIRECT
+
+  - name: Rust-Only
+    type: select
+    proxies:
+      - ss-node
+      - vmess-node
+      - trojan-node
+      - vless-node
+      - http-proxy
+      - socks5-proxy
+      - DIRECT
+
+  - name: Go-Fallback
+    type: select
+    proxies:
+      - snell-node
+      - tuic-node
+      - wireguard-node
+
+rules:
+  - DOMAIN-SUFFIX,google.com,Auto
+  - DOMAIN-SUFFIX,github.com,Auto
+  - GEOIP,CN,DIRECT
+  - MATCH,Auto

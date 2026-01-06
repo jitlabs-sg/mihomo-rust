@@ -1,0 +1,30 @@
+# Mihomo Rust Configuration
+log-level: info
+mode: rule
+
+# External controller (REST API)
+external-controller: "127.0.0.1:9090"
+secret: "test123"
+
+# Inbound proxies
+inbound:
+  mixed:
+    listen: "127.0.0.1:7890"
+    udp: true
+
+# DNS settings
+dns:
+  enable: true
+  nameserver:
+    - 8.8.8.8
+    - 8.8.4.4
+
+# Proxies (example)
+proxies: []
+
+# Proxy groups (example)
+proxy-groups: []
+
+# Rules
+rules:
+  - MATCH,DIRECT
