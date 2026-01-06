@@ -9,6 +9,8 @@ use super::{create_router, AppState};
 use std::path::Path;
 use tokio::net::UnixListener;
 use tracing::{info, warn, error};
+use hyper_util::rt::TokioIo;
+use tower::Service;
 
 /// Start Unix Domain Socket server for IPC communication
 ///
@@ -53,11 +55,29 @@ pub async fn start_unix_socket_server(state: AppState, socket_path: &str) -> Res
     info!("Unix Socket server listening on {}", socket_path);
 
     let router = create_router(state);
+    let mut make_service = router.into_make_service();
 
-    // Use axum::serve directly - it supports UnixListener natively
-    axum::serve(listener, router).await?;
+    // Accept loop for Unix socket
+    loop {
+        let (socket, _addr) = listener.accept().await?;
+        let tower_service = make_service.call(&socket).await.unwrap();
 
-    Ok(())
+        tokio::spawn(async move {
+            let socket = TokioIo::new(socket);
+            let hyper_service = hyper::service::service_fn(move |req| {
+                tower_service.clone().call(req)
+            });
+
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new()
+            )
+            .serve_connection(socket, hyper_service)
+            .await
+            {
+                warn!("Unix socket connection error: {}", e);
+            }
+        });
+    }
 }
 
 /// Cleanup Unix socket file on shutdown

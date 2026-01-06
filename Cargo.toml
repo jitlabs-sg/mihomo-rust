@@ -98,6 +98,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # Command line
 clap = { version = "4.4", features = ["derive"] }
 
+# Unix-specific
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.27", features = ["signal", "process"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = "0.5"
