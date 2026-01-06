@@ -1,7 +1,0 @@
-D:\ocr\mihomo-rust\target\release\deps\pin_project_lite-ae343acaeeab1baf.d: C:\Users\17738\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pin-project-lite-0.2.16\src\lib.rs
-
-D:\ocr\mihomo-rust\target\release\deps\libpin_project_lite-ae343acaeeab1baf.rlib: C:\Users\17738\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pin-project-lite-0.2.16\src\lib.rs
-
-D:\ocr\mihomo-rust\target\release\deps\libpin_project_lite-ae343acaeeab1baf.rmeta: C:\Users\17738\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pin-project-lite-0.2.16\src\lib.rs
-
-C:\Users\17738\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pin-project-lite-0.2.16\src\lib.rs:
