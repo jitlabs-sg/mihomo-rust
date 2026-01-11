@@ -1,6 +1,7 @@
 //! Common utilities and types
 
 pub mod error;
+pub mod buffer;
 pub mod metadata;
 pub mod net;
 pub mod socks;
