@@ -1201,8 +1201,11 @@ impl AsyncWrite for VmessConnection {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Flush any pending data, but avoid initiating an active close (FIN)
+        // to reduce TIME_WAIT pressure. With SO_LINGER=0 on the underlying
+        // TCP socket, dropping the connection will send RST instead.
         match self.as_mut().poll_flush_write_buf(cx) {
-            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_shutdown(cx),
+            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_flush(cx),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
