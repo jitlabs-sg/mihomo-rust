@@ -50,7 +50,10 @@ impl TryFrom<u8> for Command {
             CMD_CONNECT => Ok(Command::Connect),
             CMD_BIND => Ok(Command::Bind),
             CMD_UDP_ASSOCIATE => Ok(Command::UdpAssociate),
-            _ => Err(Error::protocol(format!("Unknown SOCKS5 command: {}", value))),
+            _ => Err(Error::protocol(format!(
+                "Unknown SOCKS5 command: {}",
+                value
+            ))),
         }
     }
 }
@@ -71,22 +74,56 @@ pub struct AuthRequest {
     pub methods: Vec<u8>,
 }
 
-impl AuthRequest {
-    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
-        let mut version = [0u8; 1];
-        reader.read_exact(&mut version).await?;
+#[derive(Debug, Clone, Copy)]
+pub struct AuthMethodFlags {
+    pub no_auth: bool,
+    pub username_password: bool,
+}
 
-        if version[0] != SOCKS5_VERSION {
+impl AuthMethodFlags {
+    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
+        let mut head = [0u8; 2];
+        reader.read_exact(&mut head).await?;
+
+        if head[0] != SOCKS5_VERSION {
             return Err(Error::protocol(format!(
                 "Unsupported SOCKS version: {}",
-                version[0]
+                head[0]
             )));
         }
 
-        let mut nmethods = [0u8; 1];
-        reader.read_exact(&mut nmethods).await?;
+        let n = head[1] as usize;
+        let mut methods = [0u8; 255];
+        reader.read_exact(&mut methods[..n]).await?;
 
-        let mut methods = vec![0u8; nmethods[0] as usize];
+        let mut flags = Self {
+            no_auth: false,
+            username_password: false,
+        };
+        for &m in &methods[..n] {
+            match m {
+                AUTH_NO_AUTH => flags.no_auth = true,
+                AUTH_USERNAME_PASSWORD => flags.username_password = true,
+                _ => {}
+            }
+        }
+        Ok(flags)
+    }
+}
+
+impl AuthRequest {
+    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
+        let mut head = [0u8; 2];
+        reader.read_exact(&mut head).await?;
+
+        if head[0] != SOCKS5_VERSION {
+            return Err(Error::protocol(format!(
+                "Unsupported SOCKS version: {}",
+                head[0]
+            )));
+        }
+
+        let mut methods = vec![0u8; head[1] as usize];
         reader.read_exact(&mut methods).await?;
 
         Ok(AuthRequest { methods })
@@ -123,7 +160,7 @@ pub struct Request {
 
 impl Request {
     pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
-        let mut header = [0u8; 3];
+        let mut header = [0u8; 4];
         reader.read_exact(&mut header).await?;
 
         if header[0] != SOCKS5_VERSION {
@@ -136,14 +173,50 @@ impl Request {
         let command = Command::try_from(header[1])?;
 
         // Reserved byte (header[2]) is ignored
-
-        let (address, port) = Address::read_from(reader).await?;
+        let (address, port) = read_address_and_port(reader, header[3]).await?;
 
         Ok(Request {
             command,
             address,
             port,
         })
+    }
+}
+
+async fn read_address_and_port<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    atyp: u8,
+) -> Result<(Address, u16)> {
+    match atyp {
+        ATYP_IPV4 => {
+            let mut buf = [0u8; 6];
+            reader.read_exact(&mut buf).await?;
+            let addr = Address::Ipv4(std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
+            let port = u16::from_be_bytes([buf[4], buf[5]]);
+            Ok((addr, port))
+        }
+        ATYP_DOMAIN => {
+            let mut len = [0u8; 1];
+            reader.read_exact(&mut len).await?;
+            let len = len[0] as usize;
+            let mut buf = vec![0u8; len + 2];
+            reader.read_exact(&mut buf).await?;
+            let port = u16::from_be_bytes([buf[len], buf[len + 1]]);
+            buf.truncate(len);
+            let domain = String::from_utf8(buf)
+                .map_err(|e| Error::parse(format!("Invalid domain: {}", e)))?;
+            Ok((Address::Domain(domain), port))
+        }
+        ATYP_IPV6 => {
+            let mut buf = [0u8; 18];
+            reader.read_exact(&mut buf).await?;
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&buf[..16]);
+            let addr = Address::Ipv6(std::net::Ipv6Addr::from(ip));
+            let port = u16::from_be_bytes([buf[16], buf[17]]);
+            Ok((addr, port))
+        }
+        t => Err(Error::protocol(format!("Unknown address type: {}", t))),
     }
 }
 
@@ -172,11 +245,43 @@ impl Response {
     }
 
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        writer
-            .write_all(&[SOCKS5_VERSION, self.reply, 0x00])
-            .await?;
-        self.address.write_to(writer, self.port).await?;
-        Ok(())
+        match &self.address {
+            Address::Ipv4(ip) => {
+                let mut buf = [0u8; 10];
+                buf[0] = SOCKS5_VERSION;
+                buf[1] = self.reply;
+                buf[2] = 0x00;
+                buf[3] = ATYP_IPV4;
+                buf[4..8].copy_from_slice(&ip.octets());
+                buf[8..10].copy_from_slice(&self.port.to_be_bytes());
+                writer.write_all(&buf).await?;
+                return Ok(());
+            }
+            Address::Ipv6(ip) => {
+                let mut buf = [0u8; 22];
+                buf[0] = SOCKS5_VERSION;
+                buf[1] = self.reply;
+                buf[2] = 0x00;
+                buf[3] = ATYP_IPV6;
+                buf[4..20].copy_from_slice(&ip.octets());
+                buf[20..22].copy_from_slice(&self.port.to_be_bytes());
+                writer.write_all(&buf).await?;
+                return Ok(());
+            }
+            Address::Domain(domain) => {
+                let mut buf = Vec::with_capacity(5 + domain.len() + 2);
+                buf.extend_from_slice(&[SOCKS5_VERSION, self.reply, 0x00, ATYP_DOMAIN]);
+                let bytes = domain.as_bytes();
+                if bytes.len() > 255 {
+                    return Err(Error::address("Domain name too long"));
+                }
+                buf.push(bytes.len() as u8);
+                buf.extend_from_slice(bytes);
+                buf.extend_from_slice(&self.port.to_be_bytes());
+                writer.write_all(&buf).await?;
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -331,7 +436,7 @@ mod tests {
         };
 
         let bytes = header.to_bytes();
-        let (parsed, len) = UdpHeader::from_bytes(&bytes).unwrap();
+        let (parsed, _len) = UdpHeader::from_bytes(&bytes).unwrap();
 
         assert_eq!(parsed.frag, 0);
         assert_eq!(parsed.port, 8080);
