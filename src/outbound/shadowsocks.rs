@@ -14,7 +14,7 @@ use bytes::{BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
 use md5::{Digest, Md5};
-use sha2::Sha256;
+use sha1::Sha1;
 use std::io::{self, ErrorKind};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -180,9 +180,9 @@ fn derive_key(password: &str, key_size: usize) -> Vec<u8> {
     key
 }
 
-/// Derive subkey using HKDF
+/// Derive subkey using HKDF-SHA1 (per Shadowsocks AEAD spec)
 fn derive_subkey(key: &[u8], salt: &[u8]) -> Vec<u8> {
-    let hk = Hkdf::<Sha256>::new(Some(salt), key);
+    let hk = Hkdf::<Sha1>::new(Some(salt), key);
     let mut subkey = vec![0u8; key.len()];
     hk.expand(b"ss-subkey", &mut subkey).unwrap();
     subkey
@@ -202,6 +202,7 @@ fn increment_nonce(nonce: &mut [u8]) {
 pub struct ShadowsocksConnection {
     inner: TcpStream,
     cipher: CipherKind,
+    master_key: Vec<u8>,
     // Encryption state
     enc_key: Vec<u8>,
     enc_nonce: Vec<u8>,
@@ -234,6 +235,7 @@ impl ShadowsocksConnection {
         let mut conn = ShadowsocksConnection {
             inner,
             cipher,
+            master_key: key,
             enc_key,
             enc_nonce: vec![0u8; cipher.nonce_size()],
             enc_initialized: false,
@@ -370,19 +372,67 @@ impl AsyncRead for ShadowsocksConnection {
                         return Poll::Pending;
                     }
                     let salt = self.read_buf.split_to(salt_size);
-                    // Note: We need the original key to derive subkey
-                    // This is a simplified version - in production, store the master key
-                    // For now, skip proper decryption initialization
+                    let dec_key = derive_subkey(&self.master_key, &salt);
+                    self.dec_key = Some(dec_key);
                     self.dec_initialized = true;
                 }
 
-                // Try to decrypt a chunk
-                // Simplified: just pass through for now
-                // In production, properly decrypt AEAD chunks
-                let data_len = self.read_buf.len();
-                if data_len > 0 {
-                    let to_read = std::cmp::min(buf.remaining(), data_len);
-                    buf.put_slice(&self.read_buf.split_to(to_read));
+                // Try to decrypt chunks
+                loop {
+                    let tag_size = self.cipher.tag_size();
+                    // Need at least: encrypted_length (2 + tag)
+                    let min_len = 2 + tag_size;
+                    if self.read_buf.len() < min_len {
+                        break;
+                    }
+
+                    // Copy encrypted length data to avoid borrow issues
+                    let encrypted_len_data: Vec<u8> = self.read_buf[..min_len].to_vec();
+                    let length_bytes = match self.decrypt_chunk(&encrypted_len_data) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            // Not enough data or decryption error
+                            break;
+                        }
+                    };
+
+                    if length_bytes.len() != 2 {
+                        break;
+                    }
+
+                    let payload_len = u16::from_be_bytes([length_bytes[0], length_bytes[1]]) as usize;
+                    // Mask off reserved bits
+                    let payload_len = payload_len & 0x3FFF;
+
+                    // Check if we have the full payload
+                    let total_chunk_len = min_len + payload_len + tag_size;
+                    if self.read_buf.len() < total_chunk_len {
+                        break;
+                    }
+
+                    // Consume the length part
+                    let _ = self.read_buf.split_to(min_len);
+
+                    // Copy and decrypt payload
+                    let encrypted_payload: Vec<u8> = self.read_buf[..payload_len + tag_size].to_vec();
+                    let _ = self.read_buf.split_to(payload_len + tag_size);
+                    match self.decrypt_chunk(&encrypted_payload) {
+                        Ok(payload) => {
+                            self.pending_payload.extend_from_slice(&payload);
+                        }
+                        Err(_) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                ErrorKind::InvalidData,
+                                "Decryption failed",
+                            )));
+                        }
+                    }
+                }
+
+                // Return any decrypted data
+                if !self.pending_payload.is_empty() {
+                    let to_read = std::cmp::min(buf.remaining(), self.pending_payload.len());
+                    buf.put_slice(&self.pending_payload.split_to(to_read));
                 }
 
                 Poll::Ready(Ok(()))
