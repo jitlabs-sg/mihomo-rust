@@ -7,9 +7,13 @@ use crate::{Error, Result};
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use sha2::{Digest, Sha224};
+use socket2::SockRef;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsConnector;
@@ -178,6 +182,9 @@ impl OutboundProxy for Trojan {
             match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
                 Ok(Ok(s)) => {
                     let _ = s.set_nodelay(true);
+                    // Reduce TIME_WAIT pressure under high connection churn
+                    #[cfg(unix)]
+                    let _ = SockRef::from(&s).set_linger(Some(Duration::ZERO));
                     stream = Some(s);
                     break;
                 }
@@ -264,7 +271,62 @@ impl OutboundProxy for Trojan {
             dst = %metadata.remote_address(),
             "connected"
         );
-        Ok(Box::new(tls_stream))
+        Ok(Box::new(TrojanConnection::new(tls_stream)))
+    }
+}
+
+/// Trojan connection wrapper that avoids TIME_WAIT by using abortive close.
+pub struct TrojanConnection<S> {
+    inner: S,
+}
+
+impl<S> TrojanConnection<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S> AsyncRead for TrojanConnection<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for TrojanConnection<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Avoid initiating an active close (FIN) on high-churn Trojan upstream
+        // connections. With `SO_LINGER=0` on the underlying TCP socket this
+        // helps reduce TIME_WAIT pressure and ephemeral port exhaustion.
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+        }
     }
 }
 
