@@ -1,13 +1,22 @@
 //! Network utilities
 
 use crate::{Error, Result};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use socket2::SockRef;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+use super::buffer;
+
+#[inline]
+pub fn configure_tcp_stream(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let sock = SockRef::from(stream);
+    let _ = sock.set_keepalive(true);
+    let _ = sock.set_reuse_address(true);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = sock.set_reuse_port(true);
+}
 
 /// SOCKS5 address type
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,68 +35,71 @@ impl Address {
         let mut atyp = [0u8; 1];
         reader.read_exact(&mut atyp).await?;
 
-        let addr = match atyp[0] {
-            // IPv4
+        match atyp[0] {
             0x01 => {
-                let mut buf = [0u8; 4];
+                let mut buf = [0u8; 6];
                 reader.read_exact(&mut buf).await?;
-                Address::Ipv4(Ipv4Addr::from(buf))
+                let addr = Address::Ipv4(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
+                let port = u16::from_be_bytes([buf[4], buf[5]]);
+                Ok((addr, port))
             }
-            // Domain
             0x03 => {
                 let mut len = [0u8; 1];
                 reader.read_exact(&mut len).await?;
-                let mut buf = vec![0u8; len[0] as usize];
+                let len = len[0] as usize;
+                let mut buf = vec![0u8; len + 2];
                 reader.read_exact(&mut buf).await?;
-                let domain = String::from_utf8(buf)
+                let domain = String::from_utf8(buf[..len].to_vec())
                     .map_err(|e| Error::parse(format!("Invalid domain: {}", e)))?;
-                Address::Domain(domain)
+                let port = u16::from_be_bytes([buf[len], buf[len + 1]]);
+                Ok((Address::Domain(domain), port))
             }
-            // IPv6
             0x04 => {
-                let mut buf = [0u8; 16];
+                let mut buf = [0u8; 18];
                 reader.read_exact(&mut buf).await?;
-                Address::Ipv6(Ipv6Addr::from(buf))
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(&buf[..16]);
+                let addr = Address::Ipv6(Ipv6Addr::from(ip));
+                let port = u16::from_be_bytes([buf[16], buf[17]]);
+                Ok((addr, port))
             }
-            t => return Err(Error::protocol(format!("Unknown address type: {}", t))),
-        };
-
-        let mut port_buf = [0u8; 2];
-        reader.read_exact(&mut port_buf).await?;
-        let port = u16::from_be_bytes(port_buf);
-
-        Ok((addr, port))
+            t => Err(Error::protocol(format!("Unknown address type: {}", t))),
+        }
     }
 
     /// Write in SOCKS5 format
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W, port: u16) -> Result<()> {
+        let mut buf = Vec::with_capacity(self.len());
         match self {
             Address::Ipv4(ip) => {
-                writer.write_all(&[0x01]).await?;
-                writer.write_all(&ip.octets()).await?;
+                buf.push(0x01);
+                buf.extend_from_slice(&ip.octets());
             }
             Address::Ipv6(ip) => {
-                writer.write_all(&[0x04]).await?;
-                writer.write_all(&ip.octets()).await?;
+                buf.push(0x04);
+                buf.extend_from_slice(&ip.octets());
             }
             Address::Domain(domain) => {
                 let bytes = domain.as_bytes();
                 if bytes.len() > 255 {
                     return Err(Error::address("Domain name too long"));
                 }
-                writer.write_all(&[0x03, bytes.len() as u8]).await?;
-                writer.write_all(bytes).await?;
+                buf.push(0x03);
+                buf.push(bytes.len() as u8);
+                buf.extend_from_slice(bytes);
             }
         }
-        writer.write_all(&port.to_be_bytes()).await?;
+        buf.extend_from_slice(&port.to_be_bytes());
+        writer.write_all(&buf).await?;
         Ok(())
     }
 
     /// Get bytes length
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         match self {
-            Address::Ipv4(_) => 1 + 4 + 2,       // atyp + ip + port
-            Address::Ipv6(_) => 1 + 16 + 2,      // atyp + ip + port
+            Address::Ipv4(_) => 1 + 4 + 2,             // atyp + ip + port
+            Address::Ipv6(_) => 1 + 16 + 2,            // atyp + ip + port
             Address::Domain(d) => 1 + 1 + d.len() + 2, // atyp + len + domain + port
         }
     }
@@ -160,8 +172,18 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let (a_to_b, b_to_a) = tokio::io::copy_bidirectional(a, b).await?;
-    Ok((a_to_b, b_to_a))
+    buffer::greedy_copy_bidirectional(a, b).await
+}
+
+/// Copy data between two streams bidirectionally (owned).
+pub async fn copy_bidirectional_owned<A, B>(a: A, b: B) -> Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut a = a;
+    let mut b = b;
+    buffer::greedy_copy_bidirectional(&mut a, &mut b).await
 }
 
 /// Read a single byte
