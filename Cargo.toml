@@ -22,11 +22,12 @@ tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"]
 socket2 = { version = "0.5", features = ["all"] }
 bytes = "1.5"
 
-# TLS - versions compatible with quinn 0.10
-tokio-rustls = "0.24"
-rustls = { version = "0.21", features = ["dangerous_configuration"] }
-rustls-pemfile = "1.0"
-webpki-roots = "0.25"
+# TLS - upgraded to rustls 0.23 + aws-lc-rs for better performance
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pemfile = "2.0"
+webpki-roots = "0.26"
+aws-lc-rs = "1.0"
 
 # HTTP client
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
@@ -49,8 +50,8 @@ urlencoding = "2.1"
 # Random generation
 getrandom = "0.2"
 
-# QUIC for Hysteria2
-quinn = { version = "0.10", features = ["rustls", "ring"] }
+# QUIC for Hysteria2 - upgraded to quinn 0.11 for rustls 0.23 compatibility
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio"] }
 
 # Crypto
 aes = "0.8"
@@ -101,9 +102,16 @@ chrono = { version = "0.4", features = ["serde"] }
 # Command line
 clap = { version = "4.4", features = ["derive"] }
 
+# System info
+num_cpus = "1.16"
+
+# High-performance allocator (reduces p99 latency variance)
+mimalloc = { version = "0.1", default-features = false }
+
 # Unix-specific
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.27", features = ["signal", "process"] }
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -112,6 +120,10 @@ criterion = "0.5"
 [[bench]]
 name = "api_bench"
 harness = false
+
+[[bin]]
+name = "tls_bench"
+path = "src/bin/tls_bench.rs"
 
 [profile.release]
 opt-level = 3
