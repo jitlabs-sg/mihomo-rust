@@ -18,6 +18,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
+use rustls::pki_types::ServerName;
 use tracing::{debug, Level};
 use uuid::Uuid;
 
@@ -50,7 +51,7 @@ pub struct Vless {
     skip_cert_verify: bool,
     _network: String,
     dns_resolver: Arc<Resolver>,
-    tls_server_name: Option<rustls::ServerName>,
+    tls_server_name: Option<ServerName<'static>>,
 }
 
 impl Vless {
@@ -79,9 +80,9 @@ impl Vless {
             }
         }
 
-        let tls_server_name = if tls {
+        let tls_server_name: Option<ServerName<'static>> = if tls {
             let sni = server_name.as_deref().unwrap_or(&server);
-            Some(rustls::ServerName::try_from(sni).map_err(|_| {
+            Some(sni.to_string().try_into().map_err(|_| {
                 Error::tls(format!("Invalid server name: {}", sni))
             })?)
         } else {
@@ -165,12 +166,11 @@ impl Vless {
 
         let config = if skip_cert_verify {
             ClientConfig::builder()
-                .with_safe_defaults()
+                .dangerous()
                 .with_custom_certificate_verifier(StdArc::new(NoCertificateVerification))
                 .with_no_client_auth()
         } else {
             ClientConfig::builder()
-                .with_safe_defaults()
                 .with_root_certificates(Self::get_root_store())
                 .with_no_client_auth()
         };
@@ -183,13 +183,7 @@ impl Vless {
         ROOT_STORE
             .get_or_init(|| {
                 let mut root_store = rustls::RootCertStore::empty();
-                root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-                    rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                        ta.subject,
-                        ta.spki,
-                        ta.name_constraints,
-                    )
-                }));
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 root_store
             })
             .clone()
@@ -197,19 +191,46 @@ impl Vless {
 }
 
 /// Certificate verifier that accepts any certificate
+#[derive(Debug)]
 struct NoCertificateVerification;
 
-impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
     }
 }
 

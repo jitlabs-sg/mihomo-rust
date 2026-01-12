@@ -9,7 +9,7 @@ use crate::dns::Resolver;
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine;
-use std::io::{self, ErrorKind};
+use std::io::{self};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{debug, error};
+use tracing::debug;
 
 /// Connection timeout
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -201,21 +201,22 @@ impl OutboundProxy for HttpProxy {
             // TLS connection
             use tokio_rustls::TlsConnector;
             use rustls::ClientConfig;
+            use rustls::pki_types::ServerName;
             use std::sync::Arc as StdArc;
 
-            let mut config = ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(Self::get_root_store())
-                .with_no_client_auth();
-
-            if self.skip_cert_verify {
-                config.dangerous().set_certificate_verifier(
-                    StdArc::new(NoCertificateVerification)
-                );
-            }
+            let config = if self.skip_cert_verify {
+                ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(StdArc::new(NoCertificateVerification))
+                    .with_no_client_auth()
+            } else {
+                ClientConfig::builder()
+                    .with_root_certificates(Self::get_root_store())
+                    .with_no_client_auth()
+            };
 
             let connector = TlsConnector::from(StdArc::new(config));
-            let server_name = rustls::ServerName::try_from(self.server.as_str())
+            let server_name: ServerName<'static> = self.server.clone().try_into()
                 .map_err(|_| Error::tls("Invalid server name"))?;
 
             let mut tls_stream = connector.connect(server_name, stream).await
@@ -243,33 +244,52 @@ impl OutboundProxy for HttpProxy {
 impl HttpProxy {
     fn get_root_store() -> rustls::RootCertStore {
         let mut root_store = rustls::RootCertStore::empty();
-        root_store.add_trust_anchors(
-            webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-                rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                    ta.subject.as_ref(),
-                    ta.spki.as_ref(),
-                    ta.name_constraints.as_deref(),
-                )
-            })
-        );
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         root_store
     }
 }
 
 /// Certificate verifier that accepts any certificate
+#[derive(Debug)]
 struct NoCertificateVerification;
 
-impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
     }
 }
 

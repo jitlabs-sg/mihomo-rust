@@ -9,6 +9,10 @@
 //! - `-secret` (Go style) and `--secret` (standard) both work
 //! - `-ext-ui` (Go style) and `--ext-ui` (standard) both work
 
+// Use mimalloc as global allocator for better p99 latency
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 use mihomo_rust::{Config, Gateway, VERSION};
 use std::path::PathBuf;
@@ -97,8 +101,27 @@ struct Args {
     test: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Install aws-lc-rs as the default crypto provider for rustls
+    // This provides asm-optimized crypto primitives for better TLS performance
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // Build optimized tokio runtime for low-latency proxy workloads
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_cpus::get().max(2))
+        .max_blocking_threads(32)
+        .enable_all()
+        // Reduce I/O polling overhead - check for new events every 61 ticks
+        .event_interval(61)
+        // Reduce cross-thread work stealing frequency for better cache locality
+        .global_queue_interval(31)
+        .thread_name("mihomo-worker")
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Initialize logging
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())

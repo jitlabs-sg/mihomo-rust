@@ -1,23 +1,69 @@
-//! Trojan outbound protocol
+//! Trojan outbound protocol with TLS connection pre-warming
+//!
+//! This implementation pre-establishes TLS connections to reduce handshake latency.
+//! Fresh TLS connections are kept warm and used for new requests.
+
 use super::{OutboundProxy, ProxyConnection, ProxyType};
 use crate::common::net::Address;
+use crate::common::pool_predictor::{predict_pool_iter, PredictorConfig, TimestampRingBuffer};
 use crate::common::Metadata;
 use crate::dns::Resolver;
 use crate::{Error, Result};
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
+use parking_lot::Mutex;
 use sha2::{Digest, Sha224};
 use socket2::SockRef;
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, error};
+use rustls::pki_types::ServerName;
+use tracing::{debug, trace, warn};
+
+/// Connection pool configuration (defaults, can be overridden via config)
+/// NOTE: Pool size increased from 4 to 16 to handle concurrent requests better
+/// NOTE: Max idle increased from 30s to 60s to keep warm connections longer
+const DEFAULT_POOL_SIZE: usize = 16;          // Larger pool for high concurrency
+const DEFAULT_POOL_MAX_IDLE_SECS: u64 = 60;   // Keep warm connections longer
+const DEFAULT_WARMUP_BATCH_SIZE: usize = 4;   // Warm up more connections at once
+
+/// TLS handshake latency estimate (milliseconds) for predictor
+/// NOTE: Increased from 50ms to 250ms to match real-world latency (2 RTT to remote server)
+const TLS_SETUP_LATENCY_MS: u64 = 250;
+
+/// Runtime pool configuration
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    pub size: usize,
+    pub max_idle_secs: u64,
+    pub warmup_batch_size: usize,
+    /// Enable predictive warmup based on QPS
+    pub predictive_warmup: bool,
+    /// Predictor configuration
+    pub predictor_config: PredictorConfig,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            size: DEFAULT_POOL_SIZE,
+            max_idle_secs: DEFAULT_POOL_MAX_IDLE_SECS,
+            warmup_batch_size: DEFAULT_WARMUP_BATCH_SIZE,
+            predictive_warmup: true,
+            predictor_config: PredictorConfig::default(),
+        }
+    }
+}
 
 /// Trojan command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +73,173 @@ pub enum TrojanCommand {
     UdpAssociate = 0x03,
 }
 
-/// Trojan outbound
+/// A pre-warmed TLS connection (not yet used for any target)
+struct WarmConnection {
+    stream: TlsStream<TcpStream>,
+    created_at: Instant,
+}
+
+impl WarmConnection {
+    fn new(stream: TlsStream<TcpStream>) -> Self {
+        Self {
+            stream,
+            created_at: Instant::now(),
+        }
+    }
+
+    fn is_stale(&self, max_idle_secs: u64) -> bool {
+        self.created_at.elapsed().as_secs() > max_idle_secs
+    }
+}
+
+/// Pool of pre-warmed TLS connections with predictive warmup
+struct WarmPool {
+    connections: Mutex<VecDeque<WarmConnection>>,
+    warming_count: AtomicU64,
+    /// Current pool size (atomic for lock-free reads)
+    current_size: AtomicUsize,
+    /// Request timestamps for QPS prediction (10s window, max 4096 entries)
+    request_timestamps: Mutex<TimestampRingBuffer>,
+    config: PoolConfig,
+}
+
+impl WarmPool {
+    fn new(config: PoolConfig) -> Self {
+        Self {
+            connections: Mutex::new(VecDeque::with_capacity(config.size)),
+            warming_count: AtomicU64::new(0),
+            current_size: AtomicUsize::new(0),
+            // 10 second window, max 4096 entries to bound memory
+            request_timestamps: Mutex::new(TimestampRingBuffer::new(10_000, 4096)),
+            config,
+        }
+    }
+
+    /// Get current timestamp in milliseconds
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Record a request for QPS tracking
+    fn record_request(&self) {
+        let now = Self::now_ms();
+        self.request_timestamps.lock().push(now);
+    }
+
+    /// Try to get a fresh TLS connection from the pool
+    fn try_get(&self) -> Option<TlsStream<TcpStream>> {
+        // Record request timestamp for prediction
+        self.record_request();
+
+        let mut pool = self.connections.lock();
+
+        // Find a non-stale connection
+        while let Some(conn) = pool.pop_front() {
+            if !conn.is_stale(self.config.max_idle_secs) {
+                self.current_size.store(pool.len(), Ordering::Relaxed);
+                debug!(protocol = "trojan", phase = "pool", "using pre-warmed connection");
+                return Some(conn.stream);
+            }
+            // Stale, drop it
+        }
+        self.current_size.store(0, Ordering::Relaxed);
+        None
+    }
+
+    /// Add a fresh connection to the pool
+    fn put(&self, stream: TlsStream<TcpStream>) {
+        let mut pool = self.connections.lock();
+        if pool.len() < self.config.size {
+            pool.push_back(WarmConnection::new(stream));
+            self.current_size.store(pool.len(), Ordering::Relaxed);
+        }
+        // Otherwise drop - pool is full
+    }
+
+    /// Get pool size without lock (approximate but fast)
+    fn size(&self) -> usize {
+        self.current_size.load(Ordering::Relaxed)
+    }
+
+    /// Get exact pool size (requires lock)
+    fn size_exact(&self) -> usize {
+        self.connections.lock().len()
+    }
+
+    /// Determine warmup count using predictor
+    fn predict_warmup_count(&self) -> usize {
+        if !self.config.predictive_warmup {
+            // Fallback to simple logic
+            let current = self.size();
+            let warming = self.warming_count.load(Ordering::Relaxed) as usize;
+            if current + warming < self.config.size {
+                return self.config.warmup_batch_size;
+            }
+            return 0;
+        }
+
+        let now_ms = Self::now_ms();
+        let available = self.size();
+        let warming = self.warming_count.load(Ordering::Relaxed) as usize;
+
+        let timestamps = self.request_timestamps.lock();
+        let prediction = predict_pool_iter(
+            timestamps.iter(),
+            now_ms,
+            TLS_SETUP_LATENCY_MS,
+            available,
+            warming,
+            &self.config.predictor_config,
+        );
+        drop(timestamps);
+
+        trace!(
+            protocol = "trojan",
+            qps_fast = %format!("{:.1}", prediction.qps_fast),
+            qps_slow = %format!("{:.1}", prediction.qps_slow),
+            suggested_cap = prediction.suggested_cap,
+            warmup_count = prediction.warmup_count,
+            available = available,
+            warming = warming,
+            "pool predictor"
+        );
+
+        prediction.warmup_count
+    }
+
+    fn need_warmup(&self) -> bool {
+        self.predict_warmup_count() > 0
+    }
+
+    fn start_warming(&self) -> bool {
+        let count = self.predict_warmup_count();
+        if count > 0 {
+            self.warming_count.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_warming(&self) {
+        self.warming_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn warmup_batch_size(&self) -> usize {
+        // Use predictor's suggested count, capped by config
+        let predicted = self.predict_warmup_count();
+        if predicted > 0 {
+            predicted.min(self.config.warmup_batch_size.max(1))
+        } else {
+            self.config.warmup_batch_size
+        }
+    }
+}
+
+/// Trojan outbound with TLS pre-warming
 pub struct Trojan {
     name: String,
     server: String,
@@ -35,11 +247,18 @@ pub struct Trojan {
     password_hash: String,
     udp: bool,
     sni: Option<String>,
+    #[allow(dead_code)]
     skip_cert_verify: bool,
     #[allow(dead_code)]
     network: String,
     dns_resolver: Arc<Resolver>,
     tls_connector: TlsConnector,
+    /// Pool of pre-warmed TLS connections
+    warm_pool: Arc<WarmPool>,
+    /// Cached server name for TLS
+    server_name: ServerName<'static>,
+    /// Cached resolved IPs (with TTL)
+    cached_ips: Mutex<Option<(Vec<std::net::IpAddr>, Instant)>>,
 }
 
 impl Trojan {
@@ -54,6 +273,24 @@ impl Trojan {
         network: String,
         dns_resolver: Arc<Resolver>,
     ) -> Result<Self> {
+        Self::with_pool_config(
+            name, server, port, password, udp, sni, skip_cert_verify, network,
+            dns_resolver, PoolConfig::default(),
+        )
+    }
+
+    pub fn with_pool_config(
+        name: String,
+        server: String,
+        port: u16,
+        password: String,
+        udp: bool,
+        sni: Option<String>,
+        skip_cert_verify: bool,
+        network: String,
+        dns_resolver: Arc<Resolver>,
+        pool_config: PoolConfig,
+    ) -> Result<Self> {
         let mut hasher = Sha224::new();
         hasher.update(password.as_bytes());
         let hash = hasher.finalize();
@@ -61,6 +298,11 @@ impl Trojan {
 
         let tls_config = build_tls_config(skip_cert_verify);
         let tls_connector = TlsConnector::from(Arc::new(tls_config));
+
+        // Pre-compute server name for TLS
+        let sni_str = sni.as_deref().unwrap_or(&server);
+        let server_name: ServerName<'static> = sni_str.to_string().try_into()
+            .map_err(|_| Error::tls("Invalid SNI"))?;
 
         Ok(Trojan {
             name,
@@ -73,20 +315,132 @@ impl Trojan {
             network,
             dns_resolver,
             tls_connector,
+            warm_pool: Arc::new(WarmPool::new(pool_config)),
+            server_name,
+            cached_ips: Mutex::new(None),
         })
     }
 
-    #[allow(dead_code)]
-    fn server_addr(&self) -> String {
-        format!("{}:{}", self.server, self.port)
+    /// Get cached IPs or resolve (with 60s TTL)
+    async fn get_ips(&self) -> Result<Vec<std::net::IpAddr>> {
+        {
+            let cache = self.cached_ips.lock();
+            if let Some((ips, created)) = cache.as_ref() {
+                if created.elapsed().as_secs() < 60 {
+                    return Ok(ips.clone());
+                }
+            }
+        }
+
+        let ips = self.dns_resolver.resolve_all(&self.server).await?;
+        {
+            let mut cache = self.cached_ips.lock();
+            *cache = Some((ips.clone(), Instant::now()));
+        }
+        Ok(ips)
     }
 
-    fn build_header(
-        &self,
-        command: TrojanCommand,
-        address: &Address,
-        port: u16,
-    ) -> Result<Vec<u8>> {
+    /// Create a new TLS connection
+    async fn create_tls_connection(&self) -> Result<TlsStream<TcpStream>> {
+        let ips = self.get_ips().await?;
+
+        let mut tcp_stream: Option<TcpStream> = None;
+        let mut last_err: Option<Error> = None;
+
+        for ip in ips {
+            let addr = SocketAddr::new(ip, self.port);
+            match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => {
+                    let _ = s.set_nodelay(true);
+                    #[cfg(unix)]
+                    let _ = SockRef::from(&s).set_linger(Some(Duration::ZERO));
+                    tcp_stream = Some(s);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(Error::connection(format!("TCP connect ({}): {}", addr, e)));
+                }
+                Err(_) => {
+                    last_err = Some(Error::connection(format!("TCP timeout ({})", addr)));
+                }
+            }
+        }
+
+        let tcp_stream = tcp_stream.ok_or_else(|| {
+            last_err.unwrap_or_else(|| Error::connection("No IPs"))
+        })?;
+
+        // TLS handshake
+        timeout(
+            Duration::from_secs(10),
+            self.tls_connector.clone().connect(self.server_name.clone(), tcp_stream),
+        )
+        .await
+        .map_err(|_| Error::tls("TLS timeout"))?
+        .map_err(|e| Error::tls(format!("TLS failed: {}", e)))
+    }
+
+    /// Get a TLS connection (from pool or create new)
+    async fn get_tls_connection(&self) -> Result<TlsStream<TcpStream>> {
+        // Try warm pool first
+        if let Some(stream) = self.warm_pool.try_get() {
+            return Ok(stream);
+        }
+
+        // Create new connection
+        self.create_tls_connection().await
+    }
+
+    /// Spawn background warmup tasks
+    fn spawn_warmup(&self) {
+        let batch_size = self.warm_pool.warmup_batch_size();
+        for _ in 0..batch_size {
+            if !self.warm_pool.start_warming() {
+                break;
+            }
+
+            let pool = self.warm_pool.clone();
+            let connector = self.tls_connector.clone();
+            let server_name = self.server_name.clone();
+            let resolver = self.dns_resolver.clone();
+            let server = self.server.clone();
+            let port = self.port;
+
+            tokio::spawn(async move {
+                let result = async {
+                    let ips = resolver.resolve_all(&server).await?;
+
+                    let mut tcp: Option<TcpStream> = None;
+                    for ip in ips {
+                        let addr = SocketAddr::new(ip, port);
+                        if let Ok(Ok(s)) = timeout(Duration::from_secs(3), TcpStream::connect(addr)).await {
+                            let _ = s.set_nodelay(true);
+                            #[cfg(unix)]
+                            let _ = SockRef::from(&s).set_linger(Some(Duration::ZERO));
+                            tcp = Some(s);
+                            break;
+                        }
+                    }
+                    let tcp = tcp.ok_or_else(|| Error::connection("warmup: no TCP"))?;
+
+                    timeout(Duration::from_secs(5), connector.connect(server_name, tcp))
+                        .await
+                        .map_err(|_| Error::tls("warmup: TLS timeout"))?
+                        .map_err(|e| Error::tls(format!("warmup: {}", e)))
+                }
+                .await;
+
+                pool.finish_warming();
+
+                if let Ok(stream) = result {
+                    pool.put(stream);
+                    debug!(protocol = "trojan", phase = "warmup", "connection warmed");
+                }
+            });
+        }
+    }
+
+    fn build_header(&self, command: TrojanCommand, address: &Address, port: u16) -> Result<Vec<u8>> {
         build_header_bytes(&self.password_hash, command, address, port)
     }
 }
@@ -105,7 +459,7 @@ fn encode_socks5_addr(address: &Address, port: u16) -> Result<Vec<u8>> {
         Address::Domain(domain) => {
             let bytes = domain.as_bytes();
             if bytes.len() > 255 {
-                return Err(Error::address("Domain name too long"));
+                return Err(Error::address("Domain too long"));
             }
             out.put_u8(0x03);
             out.put_u8(bytes.len() as u8);
@@ -123,8 +477,7 @@ fn build_header_bytes(
     port: u16,
 ) -> Result<Vec<u8>> {
     let socks5_addr = encode_socks5_addr(address, port)?;
-    let mut header =
-        BytesMut::with_capacity(password_hash.len() + 2 + 1 + socks5_addr.len() + 2);
+    let mut header = BytesMut::with_capacity(password_hash.len() + 2 + 1 + socks5_addr.len() + 2);
     header.put_slice(password_hash.as_bytes());
     header.put_slice(b"\r\n");
     header.put_u8(command as u8);
@@ -152,130 +505,37 @@ impl OutboundProxy for Trojan {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
-        let sni = self.sni.as_deref().unwrap_or(&self.server);
         debug!(
             protocol = "trojan",
-            phase = "dial_start",
             name = %self.name,
-            server = %self.server,
-            port = self.port,
-            sni = %sni,
             dst = %metadata.remote_address(),
-            "starting"
+            pool = self.warm_pool.size(),
+            "dial"
         );
 
-        let server_name =
-            rustls::ServerName::try_from(sni).map_err(|_| Error::tls("Invalid SNI"))?;
+        // Get TLS connection
+        let mut tls_stream = self.get_tls_connection().await?;
 
-        let ips = self.dns_resolver.resolve_all(&self.server).await?;
-        debug!(
-            protocol = "trojan",
-            phase = "resolve",
-            server = %self.server,
-            ips = ips.len(),
-            "ok"
-        );
-        let mut stream: Option<TcpStream> = None;
-        let mut last_err: Option<Error> = None;
-        for ip in ips {
-            let addr = SocketAddr::new(ip, self.port);
-            match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
-                Ok(Ok(s)) => {
-                    let _ = s.set_nodelay(true);
-                    // Reduce TIME_WAIT pressure under high connection churn
-                    #[cfg(unix)]
-                    let _ = SockRef::from(&s).set_linger(Some(Duration::ZERO));
-                    stream = Some(s);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    let err =
-                        Error::connection(format!("Trojan connect failed ({}): {}", addr, e));
-                    debug!(
-                        protocol = "trojan",
-                        phase = "tcp_connect",
-                        addr = %addr,
-                        err = %err,
-                        "failed"
-                    );
-                    last_err = Some(err);
-                }
-                Err(_) => {
-                    let err = Error::connection(format!("Trojan connect timeout ({}): 5s", addr));
-                    debug!(
-                        protocol = "trojan",
-                        phase = "tcp_connect",
-                        addr = %addr,
-                        err = %err,
-                        "timeout"
-                    );
-                    last_err = Some(err);
-                }
-            }
-        }
-        let stream = match stream {
-            Some(s) => s,
-            None => {
-                return Err(last_err.unwrap_or_else(|| {
-                    Error::connection("Trojan connect failed (no IPs)")
-                }));
-            }
-        };
-        if let Some(ref e) = last_err {
-            debug!(
-                protocol = "trojan",
-                phase = "tcp_connect",
-                err = %e,
-                "recovered after failures"
-            );
-        }
-
-        let tls_stream = timeout(
-            Duration::from_secs(10),
-            self.tls_connector.clone().connect(server_name, stream),
-        )
-        .await;
-        let mut tls_stream = match tls_stream {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                let err = Error::tls(format!("TLS handshake failed: {}", e));
-                error!(protocol = "trojan", phase = "tls_handshake", err = %err, "failed");
-                return Err(err);
-            }
-            Err(_) => {
-                let err = Error::tls("TLS handshake timeout: 10s");
-                error!(protocol = "trojan", phase = "tls_handshake", err = %err, "timeout");
-                return Err(err);
-            }
-        };
-
+        // Send Trojan header
         let address = Address::from(metadata.destination());
         let header = self.build_header(TrojanCommand::Connect, &address, metadata.dst_port)?;
-        debug!(
-            protocol = "trojan",
-            phase = "protocol_header",
-            len = header.len(),
-            "sending"
-        );
-        if let Err(e) = tls_stream.write_all(&header).await {
-            let err = Error::protocol(format!("Trojan header write failed: {}", e));
-            error!(protocol = "trojan", phase = "protocol_header", err = %err, "failed");
-            return Err(err);
-        }
-        let _ = tls_stream.flush().await;
 
-        debug!(
-            protocol = "trojan",
-            phase = "dial_ok",
-            name = %self.name,
-            dst = %metadata.remote_address(),
-            "connected"
-        );
+        if let Err(e) = tls_stream.write_all(&header).await {
+            // Stale connection, retry with fresh one
+            warn!(protocol = "trojan", err = %e, "retry with fresh connection");
+            tls_stream = self.create_tls_connection().await?;
+            tls_stream.write_all(&header).await
+                .map_err(|e| Error::protocol(format!("header write: {}", e)))?;
+        }
+
+        // Trigger background warmup
+        self.spawn_warmup();
+
         Ok(Box::new(TrojanConnection::new(tls_stream)))
     }
 }
 
-/// Trojan connection wrapper that avoids TIME_WAIT by using abortive close.
+/// Trojan connection wrapper
 pub struct TrojanConnection<S> {
     inner: S,
 }
@@ -315,13 +575,8 @@ where
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        // Avoid initiating an active close (FIN) on high-churn Trojan upstream
-        // connections. With `SO_LINGER=0` on the underlying TCP socket this
-        // helps reduce TIME_WAIT pressure and ephemeral port exhaustion.
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Just flush, let SO_LINGER=0 handle close
         match Pin::new(&mut self.inner).poll_flush(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -333,41 +588,70 @@ where
 #[derive(Debug)]
 struct NoVerifier;
 
-impl rustls::client::ServerCertVerifier for NoVerifier {
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp: &[u8],
-        _now: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
     }
 }
 
 fn build_tls_config(skip_cert_verify: bool) -> rustls::ClientConfig {
     let mut root_store = rustls::RootCertStore::empty();
-    root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject.as_ref(),
-            ta.spki.as_ref(),
-            ta.name_constraints.as_deref(),
-        )
-    }));
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     let mut config = if skip_cert_verify {
         rustls::ClientConfig::builder()
-            .with_safe_defaults()
+            .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
             .with_no_client_auth()
     } else {
         rustls::ClientConfig::builder()
-            .with_safe_defaults()
             .with_root_certificates(root_store)
             .with_no_client_auth()
     };
+
+    // Enable TLS session resumption (rustls 0.23+ defaults to enabled)
+    config.resumption = rustls::client::Resumption::default()
+        .tls12_resumption(rustls::client::Tls12Resumption::SessionIdOrTickets);
 
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     config
@@ -399,19 +683,9 @@ mod tests {
         expected.extend_from_slice(b"\r\n");
         expected.push(TrojanCommand::Connect as u8);
         expected.extend_from_slice(&[
-            0x03,
-            9, // len("mh-target")
-            b'm',
-            b'h',
-            b'-',
-            b't',
-            b'a',
-            b'r',
-            b'g',
-            b'e',
-            b't',
-            0x46,
-            0xA0, // 18080
+            0x03, 9,
+            b'm', b'h', b'-', b't', b'a', b'r', b'g', b'e', b't',
+            0x46, 0xA0,
         ]);
         expected.extend_from_slice(b"\r\n");
 
