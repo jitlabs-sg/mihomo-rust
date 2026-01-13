@@ -1,0 +1,26 @@
+# Perf config: force Go-fallback routing (via a Go-fallback proxy name)
+log-level: warning
+mode: rule
+
+external-controller: "127.0.0.1:9090"
+secret: "test123"
+
+inbound:
+  mixed:
+    listen: "127.0.0.1:7891"
+    udp: true
+
+dns:
+  enable: false
+
+proxies:
+  - name: "HY2"
+    type: hysteria2
+    server: example.com
+    port: 443
+
+proxy-groups: []
+
+rules:
+  - MATCH,HY2
+

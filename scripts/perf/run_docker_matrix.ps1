@@ -291,9 +291,9 @@ function New-RunRow {
 
 function Format-LatencyLine {
   param([Parameter(Mandatory = $true)]$Result)
-  "{0,-4} {1,-6} {2,-11} ok={3,6} err={4,6} p50={5,7:N2}ms p90={6,7:N2}ms p99={7,7:N2}ms stdev={8,7:N2}ms" -f `
+  "{0,-4} {1,-6} {2,-11} ok={3,6} err={4,6} p50={5,7:N2}ms p90={6,7:N2}ms p99={7,7:N2}ms p99.9={8,7:N2}ms stdev={9,7:N2}ms" -f `
     $Result.impl, $Result.protocol, $Result.kind, $Result.ok, $Result.errors, `
-    $Result.latency_ms.p50, $Result.latency_ms.p90, $Result.latency_ms.p99, $Result.latency_ms.stdev
+    $Result.latency_ms.p50, $Result.latency_ms.p90, $Result.latency_ms.p99, $Result.latency_ms.p999, $Result.latency_ms.stdev
 }
 
 $perfDir = $PSScriptRoot
@@ -312,7 +312,7 @@ if (-not $RustBin) {
   $RustBin = Join-Path $repoRoot 'target-linux-bullseye\release\mihomo-rust'
 }
 if (-not $GoBin) {
-  $GoBin = Join-Path $repoRoot 'mihomo'
+  $GoBin = Join-Path $repoRoot 'mihomo-go'
 }
 
 if ($RustBin -and -not [IO.Path]::IsPathRooted($RustBin)) {
@@ -527,12 +527,14 @@ try {
       # Run from /work so mihomo-rust can spawn `./mihomo` (Go-fallback) when enabled.
       $sh = "set -e; cd /work; chmod +x '$coreBinInContainer'; '$coreBinInContainer' $cfgFlag '$cfgInContainer'"
 
+      # Use bullseye for Rust (matches build env), bookworm for Go (needs newer GLIBC)
+      $dockerImage = if ($implName -eq 'go') { 'debian:bookworm-slim' } else { 'debian:bullseye-slim' }
       $dockerArgs = @(
         'run', '-d',
         '--name', $coreContainer,
         '--network', $Network
       ) + $mountArgs + @(
-        'debian:bullseye-slim',
+        $dockerImage,
         'sh', '-lc', $sh
       )
       if ($env:RUST_LOG) {
@@ -583,6 +585,7 @@ try {
       @{ Name = 'p50_ms'; Expression = { $_.latency_ms.p50 } }, `
       @{ Name = 'p90_ms'; Expression = { $_.latency_ms.p90 } }, `
       @{ Name = 'p99_ms'; Expression = { $_.latency_ms.p99 } }, `
+      @{ Name = 'p999_ms'; Expression = { $_.latency_ms.p999 } }, `
       @{ Name = 'stdev_ms'; Expression = { $_.latency_ms.stdev } } |
     Export-Csv -NoTypeInformation -Encoding UTF8 -Path $summaryCsvPath
 
