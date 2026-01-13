@@ -31,7 +31,7 @@ async fn get_all_groups(state: &AppState) -> Value {
         let name = &group_config.name;
         
         // Get all proxies in this group
-        let mut all_proxies = group_config.proxies.clone();
+        let all_proxies = group_config.proxies.clone();
         
         // TODO: Add proxies from providers when implemented
         
@@ -74,7 +74,7 @@ pub async fn get_group(
     
     for group_config in &config.proxy_groups {
         if group_config.name == name {
-            let mut all_proxies = group_config.proxies.clone();
+            let all_proxies = group_config.proxies.clone();
             let now = all_proxies.first().cloned().unwrap_or_default();
 
             return Ok(Json(json!({
@@ -134,8 +134,8 @@ pub async fn get_group_delay(
 
 /// Test delay for a single proxy
 async fn test_proxy_delay(
-    state: &AppState,
-    proxy_name: &str,
+    _state: &AppState,
+    _proxy_name: &str,
     url: &str,
     timeout: Duration,
     expected: Option<u16>,

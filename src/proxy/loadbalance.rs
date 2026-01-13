@@ -8,7 +8,6 @@ use crate::outbound::{OutboundProxy, ProxyConnection, ProxyType};
 use crate::provider::ProxyProvider;
 use crate::{Error, Result};
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -79,7 +78,7 @@ impl OutboundProxy for LoadBalance {
         !self.disable_udp
     }
 
-    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
+    async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
         Err(Error::unsupported("LoadBalance not fully implemented"))
     }
 }
@@ -105,7 +104,7 @@ impl ProxyGroup for LoadBalance {
         names
     }
 
-    fn set(&self, name: &str) -> Result<()> {
+    fn set(&self, _name: &str) -> Result<()> {
         Err(Error::unsupported("Cannot manually select in LoadBalance group"))
     }
 
@@ -121,7 +120,7 @@ impl ProxyGroup for LoadBalance {
         &self.test_url
     }
 
-    async fn url_test(&self, url: &str, expected: Option<ExpectedStatus>)
+    async fn url_test(&self, _url: &str, _expected: Option<ExpectedStatus>)
         -> Result<HashMap<String, u16>> {
         Ok(HashMap::new())
     }

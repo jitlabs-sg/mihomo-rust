@@ -3,7 +3,7 @@
 //! To be fully implemented in Phase 3.
 
 use super::{Fetcher, ProviderType, VehicleType};
-use crate::{Error, Result};
+use crate::Result;
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -50,7 +50,7 @@ impl RuleProvider {
         }
     }
 
-    pub fn new_file(name: String, path: PathBuf, behavior: RuleBehavior) -> Self {
+    pub fn new_file(name: String, _path: PathBuf, behavior: RuleBehavior) -> Self {
         RuleProvider {
             name,
             vehicle_type: VehicleType::File,

@@ -4,20 +4,18 @@
 //! through the Go mihomo child process via HTTP CONNECT.
 
 use crate::common::Metadata;
-use crate::dns::Resolver;
 use crate::outbound::{OutboundProxy, ProxyConnection, ProxyType};
 use crate::{Error, Result};
 use async_trait::async_trait;
-use std::io::{self, ErrorKind};
+use std::io::{self};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{debug, error, warn};
+use tracing::debug;
 
 /// Connection timeout for Go fallback
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

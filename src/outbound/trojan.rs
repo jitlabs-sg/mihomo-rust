@@ -28,7 +28,7 @@ use tokio::time::{timeout, Duration};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use rustls::pki_types::ServerName;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Connection pool configuration (defaults, can be overridden via config)
 /// NOTE: Pool size increased from 4 to 16 to handle concurrent requests better
@@ -101,6 +101,9 @@ struct WarmPool {
     /// Request timestamps for QPS prediction (10s window, max 4096 entries)
     request_timestamps: Mutex<TimestampRingBuffer>,
     config: PoolConfig,
+    /// Pool statistics for diagnostics
+    stats_hit: AtomicU64,
+    stats_miss: AtomicU64,
 }
 
 impl WarmPool {
@@ -112,6 +115,8 @@ impl WarmPool {
             // 10 second window, max 4096 entries to bound memory
             request_timestamps: Mutex::new(TimestampRingBuffer::new(10_000, 4096)),
             config,
+            stats_hit: AtomicU64::new(0),
+            stats_miss: AtomicU64::new(0),
         }
     }
 
@@ -140,13 +145,24 @@ impl WarmPool {
         while let Some(conn) = pool.pop_front() {
             if !conn.is_stale(self.config.max_idle_secs) {
                 self.current_size.store(pool.len(), Ordering::Relaxed);
+                self.stats_hit.fetch_add(1, Ordering::Relaxed);
                 debug!(protocol = "trojan", phase = "pool", "using pre-warmed connection");
                 return Some(conn.stream);
             }
             // Stale, drop it
         }
         self.current_size.store(0, Ordering::Relaxed);
+        self.stats_miss.fetch_add(1, Ordering::Relaxed);
         None
+    }
+    
+    /// Get pool statistics (hit, miss, hit_rate%)
+    fn stats(&self) -> (u64, u64, f64) {
+        let hit = self.stats_hit.load(Ordering::Relaxed);
+        let miss = self.stats_miss.load(Ordering::Relaxed);
+        let total = hit + miss;
+        let rate = if total > 0 { (hit as f64 / total as f64) * 100.0 } else { 0.0 };
+        (hit, miss, rate)
     }
 
     /// Add a fresh connection to the pool
@@ -387,6 +403,7 @@ impl Trojan {
             return Ok(stream);
         }
 
+
         // Create new connection
         self.create_tls_connection().await
     }
@@ -442,6 +459,24 @@ impl Trojan {
 
     fn build_header(&self, command: TrojanCommand, address: &Address, port: u16) -> Result<Vec<u8>> {
         build_header_bytes(&self.password_hash, command, address, port)
+    }
+    
+    /// Get pool statistics: (hit, miss, hit_rate%)
+    pub fn pool_stats(&self) -> (u64, u64, f64) {
+        self.warm_pool.stats()
+    }
+    
+    /// Print pool statistics to log
+    pub fn log_pool_stats(&self) {
+        let (hit, miss, rate) = self.pool_stats();
+        info!(
+            protocol = "trojan",
+            name = %self.name,
+            pool_hit = hit,
+            pool_miss = miss,
+            hit_rate = format!("{:.1}%", rate),
+            "pool statistics"
+        );
     }
 }
 
@@ -530,6 +565,13 @@ impl OutboundProxy for Trojan {
 
         // Trigger background warmup
         self.spawn_warmup();
+
+        // Log pool stats every 1000 requests
+        let (hit, miss, _) = self.warm_pool.stats();
+        let total = hit + miss;
+        if total > 0 && total % 1000 == 0 {
+            self.log_pool_stats();
+        }
 
         Ok(Box::new(TrojanConnection::new(tls_stream)))
     }

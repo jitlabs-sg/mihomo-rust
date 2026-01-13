@@ -61,7 +61,7 @@ impl OutboundProxy for URLTest {
         !self.disable_udp
     }
 
-    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
+    async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
         Err(Error::unsupported("URLTest not fully implemented"))
     }
 }
@@ -86,7 +86,7 @@ impl ProxyGroup for URLTest {
         names
     }
 
-    fn set(&self, name: &str) -> Result<()> {
+    fn set(&self, _name: &str) -> Result<()> {
         Err(Error::unsupported("Cannot manually select in URLTest group"))
     }
 
@@ -102,7 +102,7 @@ impl ProxyGroup for URLTest {
         &self.test_url
     }
 
-    async fn url_test(&self, url: &str, expected: Option<ExpectedStatus>)
+    async fn url_test(&self, _url: &str, _expected: Option<ExpectedStatus>)
         -> Result<HashMap<String, u16>> {
         // TODO: Implement URL test
         Ok(HashMap::new())

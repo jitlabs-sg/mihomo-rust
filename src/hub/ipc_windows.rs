@@ -6,7 +6,7 @@
 use crate::Result;
 use super::{create_router, AppState};
 
-use axum::{body::Body, extract::Request, Router};
+use axum::{body::Body, extract::Request};
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},

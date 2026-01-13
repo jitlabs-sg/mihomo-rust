@@ -11,7 +11,7 @@ use axum::{
     },
     response::Response,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::debug;

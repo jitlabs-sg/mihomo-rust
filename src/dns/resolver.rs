@@ -8,10 +8,10 @@ use hickory_resolver::config::{
 };
 use hickory_resolver::TokioAsyncResolver;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// DNS resolver with caching and multiple upstream servers
 pub struct Resolver {
@@ -214,31 +214,31 @@ impl Resolver {
     async fn lookup(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let mut ips = Vec::new();
 
-        // Query IPv4
-        let ipv4_future = self.resolver.ipv4_lookup(domain);
+        // Query IPv4 and IPv6 concurrently for lower latency
+        if self.ipv6 {
+            // Concurrent query: IPv4 + IPv6 (with timeout)
+            let ipv4_future = self.resolver.ipv4_lookup(domain);
+            let ipv6_future = tokio::time::timeout(
+                self.ipv6_timeout,
+                self.resolver.ipv6_lookup(domain),
+            );
 
-        // Query IPv6 if enabled
-        let ipv6_future = if self.ipv6 {
-            Some(self.resolver.ipv6_lookup(domain))
-        } else {
-            None
-        };
+            let (ipv4_result, ipv6_result) = tokio::join!(ipv4_future, ipv6_future);
 
-        // Get IPv4 results
-        match ipv4_future.await {
-            Ok(response) => {
-                for ip in response.iter() {
-                    ips.push(IpAddr::V4(ip.0));
+            // Process IPv4 results
+            match ipv4_result {
+                Ok(response) => {
+                    for ip in response.iter() {
+                        ips.push(IpAddr::V4(ip.0));
+                    }
+                }
+                Err(e) => {
+                    debug!("IPv4 lookup failed for {}: {}", domain, e);
                 }
             }
-            Err(e) => {
-                debug!("IPv4 lookup failed for {}: {}", domain, e);
-            }
-        }
 
-        // Get IPv6 results (with timeout)
-        if let Some(ipv6_future) = ipv6_future {
-            match tokio::time::timeout(self.ipv6_timeout, ipv6_future).await {
+            // Process IPv6 results
+            match ipv6_result {
                 Ok(Ok(response)) => {
                     for ip in response.iter() {
                         ips.push(IpAddr::V6(ip.0));
@@ -249,6 +249,18 @@ impl Resolver {
                 }
                 Err(_) => {
                     debug!("IPv6 lookup timed out for {}", domain);
+                }
+            }
+        } else {
+            // IPv4 only
+            match self.resolver.ipv4_lookup(domain).await {
+                Ok(response) => {
+                    for ip in response.iter() {
+                        ips.push(IpAddr::V4(ip.0));
+                    }
+                }
+                Err(e) => {
+                    debug!("IPv4 lookup failed for {}: {}", domain, e);
                 }
             }
         }
@@ -283,6 +295,7 @@ impl Resolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[tokio::test]
     async fn test_resolver_ip_passthrough() {

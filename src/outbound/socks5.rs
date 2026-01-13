@@ -7,16 +7,13 @@ use crate::common::Metadata;
 use crate::dns::Resolver;
 use crate::{Error, Result};
 use async_trait::async_trait;
-use std::io::{self, ErrorKind};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::pin::Pin;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{debug, error};
+use tracing::debug;
 
 /// Connection timeout
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

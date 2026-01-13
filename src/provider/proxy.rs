@@ -5,7 +5,7 @@
 use super::{Fetcher, HealthCheck, ProxyProvider, ProviderType, SubscriptionInfo, VehicleType};
 use crate::outbound::OutboundProxy;
 use crate::proxy::ExpectedStatus;
-use crate::{Error, Result};
+use crate::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
@@ -76,7 +76,7 @@ impl ProxyProvider for ProxySetProvider {
     }
 
     async fn update(&self) -> Result<()> {
-        let (content, headers) = self.fetcher.fetch().await?;
+        let (_content, headers) = self.fetcher.fetch().await?;
 
         // Parse subscription info from headers
         if let Some(info_header) = headers.get("subscription-userinfo") {
@@ -98,7 +98,7 @@ impl ProxyProvider for ProxySetProvider {
 
     async fn initial(&self) -> Result<()> {
         // Try to load from cache first
-        if let Ok(content) = self.fetcher.load_cache().await {
+        if let Ok(_content) = self.fetcher.load_cache().await {
             // TODO: Parse proxies from cache
         }
 

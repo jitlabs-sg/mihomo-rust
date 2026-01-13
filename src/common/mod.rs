@@ -10,6 +10,7 @@ pub mod socks;
 pub mod memory_pressure;
 pub mod pool_predictor;
 pub mod proxy_node_selection;
+pub mod http_pool;
 
 pub use error::{Error, Result};
 pub use metadata::{ConnType, DnsMode, Metadata, Network};

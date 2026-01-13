@@ -57,7 +57,7 @@ impl OutboundProxy for Fallback {
         !self.disable_udp
     }
 
-    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
+    async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
         Err(Error::unsupported("Fallback not fully implemented"))
     }
 }
@@ -82,7 +82,7 @@ impl ProxyGroup for Fallback {
         names
     }
 
-    fn set(&self, name: &str) -> Result<()> {
+    fn set(&self, _name: &str) -> Result<()> {
         Err(Error::unsupported("Cannot manually select in Fallback group"))
     }
 
@@ -98,7 +98,7 @@ impl ProxyGroup for Fallback {
         &self.test_url
     }
 
-    async fn url_test(&self, url: &str, expected: Option<ExpectedStatus>)
+    async fn url_test(&self, _url: &str, _expected: Option<ExpectedStatus>)
         -> Result<HashMap<String, u16>> {
         Ok(HashMap::new())
     }

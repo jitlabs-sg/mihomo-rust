@@ -3,13 +3,11 @@
 use crate::{Error, Result};
 use base64::Engine;
 use bytes::{BufMut, BytesMut};
-use rand::Rng;
 use sha1::{Digest, Sha1};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
 use tracing::debug;
 
 /// WebSocket opcode

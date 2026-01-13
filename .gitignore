@@ -1,4 +1,35 @@
+# Build
 /target/
-*.pdb
+/target-linux/
+/target-linux-bullseye/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+tmp_*.log
+
+# Temp files
+tmpclaude-*
+nul
+
+# Binaries
+mihomo-go
+mihomo-go.gz
+mihomo-rust
 *.exe
-.env
+*.pdb
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Test artifacts
+scripts/perf/_tmp/
+scripts/perf/mihomo-rust
+*.bak
+allcode.rs

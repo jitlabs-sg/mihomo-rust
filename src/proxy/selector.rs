@@ -55,7 +55,7 @@ impl OutboundProxy for Selector {
         !self.disable_udp
     }
 
-    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
+    async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
         // TODO: Implement actual proxy dialing
         Err(Error::unsupported("Selector not fully implemented"))
     }
@@ -98,7 +98,7 @@ impl ProxyGroup for Selector {
         &self.test_url
     }
 
-    async fn url_test(&self, url: &str, expected: Option<ExpectedStatus>)
+    async fn url_test(&self, _url: &str, _expected: Option<ExpectedStatus>)
         -> Result<HashMap<String, u16>> {
         // TODO: Implement URL test
         Ok(HashMap::new())
