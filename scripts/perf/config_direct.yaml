@@ -1,0 +1,22 @@
+# Perf config: Rust direct path (no Go fallback)
+log-level: warning
+mode: rule
+
+# External controller (REST API)
+external-controller: "127.0.0.1:9090"
+secret: "test123"
+
+inbound:
+  mixed:
+    listen: "127.0.0.1:7890"
+    udp: true
+
+dns:
+  enable: false
+
+proxies: []
+proxy-groups: []
+
+rules:
+  - MATCH,DIRECT
+

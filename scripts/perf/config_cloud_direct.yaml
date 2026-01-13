@@ -1,0 +1,17 @@
+log-level: warning
+mode: rule
+
+inbound:
+  mixed:
+    listen: "0.0.0.0:7890"
+    udp: true
+
+dns:
+  enable: false
+
+proxies: []
+
+proxy-groups: []
+
+rules:
+  - MATCH,DIRECT

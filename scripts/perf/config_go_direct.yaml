@@ -1,0 +1,20 @@
+# Perf config: Go mihomo direct path (no upstream proxies)
+log-level: warning
+mode: rule
+
+# Inbound (Go mihomo format)
+mixed-port: 7890
+
+# REST API
+external-controller: "127.0.0.1:9090"
+secret: "test123"
+
+dns:
+  enable: false
+
+proxies: []
+proxy-groups: []
+
+rules:
+  - MATCH,DIRECT
+
