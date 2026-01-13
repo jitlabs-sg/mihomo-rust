@@ -184,13 +184,13 @@ pub async fn get_proxy_delay(
         }
     };
 
-    let proxy = match proxy {
+    let _proxy = match proxy {
         Some(p) => p,
         None => return Err(ApiError::not_found("Proxy")),
     };
 
     // Test delay
-    let timeout = Duration::from_millis(params.timeout);
+    let _timeout = Duration::from_millis(params.timeout);
     let start = std::time::Instant::now();
 
     // TODO: Implement actual delay test via proxy

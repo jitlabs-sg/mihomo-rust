@@ -4,7 +4,6 @@ use super::{OutboundProxy, ProxyConnection, ProxyType};
 use crate::common::Metadata;
 use crate::{Error, Result};
 use async_trait::async_trait;
-use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tracing::debug;
 
@@ -57,6 +56,9 @@ impl OutboundProxy for Direct {
         let stream = TcpStream::connect(&addr)
             .await
             .map_err(|e| Error::connection(format!("Failed to connect to {}: {}", addr, e)))?;
+
+        // Disable Nagle's algorithm for lower latency
+        let _ = stream.set_nodelay(true);
 
         debug!("Direct connected to {}", addr);
         Ok(Box::new(stream))

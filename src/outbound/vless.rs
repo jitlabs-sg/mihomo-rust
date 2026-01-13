@@ -1,25 +1,32 @@
-//! VLESS protocol outbound
+//! VLESS protocol outbound with TLS connection pre-warming
 //!
 //! Implements VLESS protocol (V2Ray's lightweight protocol variant).
 //! VLESS removes the encryption layer from VMess, relying on TLS for security.
+//! This implementation pre-establishes TLS connections to reduce handshake latency.
 
 use super::{OutboundProxy, ProxyConnection, ProxyType};
+use crate::common::pool_predictor::{predict_pool_iter, PredictorConfig, TimestampRingBuffer};
 use crate::common::Metadata;
 use crate::dns::Resolver;
 use crate::{Error, Result};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io::{self, ErrorKind};
+use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use rustls::pki_types::ServerName;
-use tracing::{debug, Level};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 /// Connection timeout
@@ -38,7 +45,193 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
 
-/// VLESS proxy outbound
+/// Connection pool configuration
+const DEFAULT_POOL_SIZE: usize = 16;
+const DEFAULT_POOL_MAX_IDLE_SECS: u64 = 60;
+const DEFAULT_WARMUP_BATCH_SIZE: usize = 4;
+
+/// TLS handshake latency estimate (milliseconds) for predictor
+const TLS_SETUP_LATENCY_MS: u64 = 250;
+
+/// Runtime pool configuration
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    pub size: usize,
+    pub max_idle_secs: u64,
+    pub warmup_batch_size: usize,
+    pub predictive_warmup: bool,
+    pub predictor_config: PredictorConfig,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            size: DEFAULT_POOL_SIZE,
+            max_idle_secs: DEFAULT_POOL_MAX_IDLE_SECS,
+            warmup_batch_size: DEFAULT_WARMUP_BATCH_SIZE,
+            predictive_warmup: true,
+            predictor_config: PredictorConfig::default(),
+        }
+    }
+}
+
+/// A pre-warmed TLS connection (not yet used for any target)
+struct WarmConnection {
+    stream: TlsStream<TcpStream>,
+    created_at: Instant,
+}
+
+impl WarmConnection {
+    fn new(stream: TlsStream<TcpStream>) -> Self {
+        Self {
+            stream,
+            created_at: Instant::now(),
+        }
+    }
+
+    fn is_stale(&self, max_idle_secs: u64) -> bool {
+        self.created_at.elapsed().as_secs() > max_idle_secs
+    }
+}
+
+/// Pool of pre-warmed TLS connections with predictive warmup
+struct WarmPool {
+    connections: Mutex<VecDeque<WarmConnection>>,
+    warming_count: AtomicU64,
+    current_size: AtomicUsize,
+    request_timestamps: Mutex<TimestampRingBuffer>,
+    config: PoolConfig,
+    stats_hit: AtomicU64,
+    stats_miss: AtomicU64,
+}
+
+impl WarmPool {
+    fn new(config: PoolConfig) -> Self {
+        Self {
+            connections: Mutex::new(VecDeque::with_capacity(config.size)),
+            warming_count: AtomicU64::new(0),
+            current_size: AtomicUsize::new(0),
+            request_timestamps: Mutex::new(TimestampRingBuffer::new(10_000, 4096)),
+            config,
+            stats_hit: AtomicU64::new(0),
+            stats_miss: AtomicU64::new(0),
+        }
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn record_request(&self) {
+        let now = Self::now_ms();
+        self.request_timestamps.lock().push(now);
+    }
+
+    fn try_get(&self) -> Option<TlsStream<TcpStream>> {
+        self.record_request();
+
+        let mut pool = self.connections.lock();
+
+        while let Some(conn) = pool.pop_front() {
+            if !conn.is_stale(self.config.max_idle_secs) {
+                self.current_size.store(pool.len(), Ordering::Relaxed);
+                self.stats_hit.fetch_add(1, Ordering::Relaxed);
+                debug!(protocol = "vless", phase = "pool", "using pre-warmed connection");
+                return Some(conn.stream);
+            }
+        }
+        self.current_size.store(0, Ordering::Relaxed);
+        self.stats_miss.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    fn stats(&self) -> (u64, u64, f64) {
+        let hit = self.stats_hit.load(Ordering::Relaxed);
+        let miss = self.stats_miss.load(Ordering::Relaxed);
+        let total = hit + miss;
+        let rate = if total > 0 { (hit as f64 / total as f64) * 100.0 } else { 0.0 };
+        (hit, miss, rate)
+    }
+
+    fn put(&self, stream: TlsStream<TcpStream>) {
+        let mut pool = self.connections.lock();
+        if pool.len() < self.config.size {
+            pool.push_back(WarmConnection::new(stream));
+            self.current_size.store(pool.len(), Ordering::Relaxed);
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.current_size.load(Ordering::Relaxed)
+    }
+
+    fn predict_warmup_count(&self) -> usize {
+        if !self.config.predictive_warmup {
+            let current = self.size();
+            let warming = self.warming_count.load(Ordering::Relaxed) as usize;
+            if current + warming < self.config.size {
+                return self.config.warmup_batch_size;
+            }
+            return 0;
+        }
+
+        let now_ms = Self::now_ms();
+        let available = self.size();
+        let warming = self.warming_count.load(Ordering::Relaxed) as usize;
+
+        let timestamps = self.request_timestamps.lock();
+        let prediction = predict_pool_iter(
+            timestamps.iter(),
+            now_ms,
+            TLS_SETUP_LATENCY_MS,
+            available,
+            warming,
+            &self.config.predictor_config,
+        );
+        drop(timestamps);
+
+        trace!(
+            protocol = "vless",
+            qps_fast = %format!("{:.1}", prediction.qps_fast),
+            qps_slow = %format!("{:.1}", prediction.qps_slow),
+            suggested_cap = prediction.suggested_cap,
+            warmup_count = prediction.warmup_count,
+            available = available,
+            warming = warming,
+            "pool predictor"
+        );
+
+        prediction.warmup_count
+    }
+
+    fn start_warming(&self) -> bool {
+        let count = self.predict_warmup_count();
+        if count > 0 {
+            self.warming_count.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_warming(&self) {
+        self.warming_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn warmup_batch_size(&self) -> usize {
+        let predicted = self.predict_warmup_count();
+        if predicted > 0 {
+            predicted.min(self.config.warmup_batch_size.max(1))
+        } else {
+            self.config.warmup_batch_size
+        }
+    }
+}
+
+/// VLESS proxy outbound with TLS pre-warming
 pub struct Vless {
     name: String,
     server: String,
@@ -52,6 +245,9 @@ pub struct Vless {
     _network: String,
     dns_resolver: Arc<Resolver>,
     tls_server_name: Option<ServerName<'static>>,
+    tls_connector: Option<TlsConnector>,
+    warm_pool: Option<Arc<WarmPool>>,
+    cached_ips: Mutex<Option<(Vec<std::net::IpAddr>, Instant)>>,
 }
 
 impl Vless {
@@ -73,7 +269,6 @@ impl Vless {
         let uuid = Uuid::parse_str(&uuid_str)
             .map_err(|e| Error::config(format!("Invalid UUID: {}", e)))?;
 
-        // Validate flow
         if let Some(ref flow) = flow {
             if !matches!(flow.as_str(), "xtls-rprx-vision" | "xtls-rprx-direct" | "") {
                 return Err(Error::config(format!("Invalid flow: {}", flow)));
@@ -89,6 +284,14 @@ impl Vless {
             None
         };
 
+        let (tls_connector, warm_pool) = if tls {
+            let connector = Self::create_tls_connector(skip_cert_verify)?;
+            let pool = Arc::new(WarmPool::new(PoolConfig::default()));
+            (Some(connector), Some(pool))
+        } else {
+            (None, None)
+        };
+
         Ok(Vless {
             name,
             server,
@@ -102,29 +305,22 @@ impl Vless {
             _network: network,
             dns_resolver,
             tls_server_name,
+            tls_connector,
+            warm_pool,
+            cached_ips: Mutex::new(None),
         })
     }
 
     /// Build VLESS request header
-    fn build_request(&self, host: &str, port: u16, cmd: u8) -> Vec<u8> {        
+    fn build_request(&self, host: &str, port: u16, cmd: u8) -> Vec<u8> {
         let mut request = Vec::with_capacity(128);
 
-        // Version (1 byte)
         request.push(VLESS_VERSION);
-
-        // UUID (16 bytes)
         request.extend_from_slice(self.uuid.as_bytes());
-
-        // Addons length (1 byte)
-        request.push(0);
-
-        // Command (1 byte)
+        request.push(0); // Addons length
         request.push(cmd);
-
-        // Port (2 bytes, big endian)
         request.extend_from_slice(&port.to_be_bytes());
 
-        // Address type and address
         if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
             request.push(ATYP_IPV4);
             request.extend_from_slice(&ip.octets());
@@ -132,7 +328,6 @@ impl Vless {
             request.push(ATYP_IPV6);
             request.extend_from_slice(&ip.octets());
         } else {
-            // Domain name
             request.push(ATYP_DOMAIN);
             request.push(host.len() as u8);
             request.extend_from_slice(host.as_bytes());
@@ -145,11 +340,6 @@ impl Vless {
         #[cfg(unix)]
         {
             use socket2::SockRef;
-
-            // Reduce TIME_WAIT pressure under high connection churn by using an abortive close.
-            // VLESS upstream (e.g. xray) tends to wait for the client to close first, so the
-            // client side otherwise accumulates TIME_WAIT sockets and may exhaust the ephemeral
-            // port range (os error 99).
             let _ = SockRef::from(stream).set_linger(Some(Duration::ZERO));
         }
 
@@ -159,7 +349,6 @@ impl Vless {
         }
     }
 
-    /// Create TLS connector
     fn create_tls_connector(skip_cert_verify: bool) -> Result<TlsConnector> {
         use rustls::ClientConfig;
         use std::sync::Arc as StdArc;
@@ -187,6 +376,163 @@ impl Vless {
                 root_store
             })
             .clone()
+    }
+
+    /// Get cached IPs or resolve (with 60s TTL)
+    async fn get_ips(&self) -> Result<Vec<std::net::IpAddr>> {
+        {
+            let cache = self.cached_ips.lock();
+            if let Some((ips, created)) = cache.as_ref() {
+                if created.elapsed().as_secs() < 60 {
+                    return Ok(ips.clone());
+                }
+            }
+        }
+
+        let ips = self.dns_resolver.resolve_all(&self.server).await?;
+        {
+            let mut cache = self.cached_ips.lock();
+            *cache = Some((ips.clone(), Instant::now()));
+        }
+        Ok(ips)
+    }
+
+    /// Create a new TLS connection
+    async fn create_tls_connection(&self) -> Result<TlsStream<TcpStream>> {
+        let connector = self.tls_connector.as_ref()
+            .ok_or_else(|| Error::tls("TLS not enabled"))?;
+        let server_name = self.tls_server_name.clone()
+            .ok_or_else(|| Error::tls("Missing TLS server name"))?;
+
+        let ips = self.get_ips().await?;
+
+        let mut tcp_stream: Option<TcpStream> = None;
+        let mut last_err: Option<Error> = None;
+
+        for ip in ips {
+            let addr = SocketAddr::new(ip, self.port);
+            match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => {
+                    let _ = s.set_nodelay(true);
+                    Self::configure_socket(&s);
+                    tcp_stream = Some(s);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(Error::connection(format!("TCP connect ({}): {}", addr, e)));
+                }
+                Err(_) => {
+                    last_err = Some(Error::connection(format!("TCP timeout ({})", addr)));
+                }
+            }
+        }
+
+        let tcp_stream = tcp_stream.ok_or_else(|| {
+            last_err.unwrap_or_else(|| Error::connection("No IPs"))
+        })?;
+
+        timeout(
+            CONNECT_TIMEOUT,
+            connector.clone().connect(server_name, tcp_stream),
+        )
+        .await
+        .map_err(|_| Error::tls("TLS timeout"))?
+        .map_err(|e| Error::tls(format!("TLS failed: {}", e)))
+    }
+
+    /// Get a TLS connection (from pool or create new)
+    async fn get_tls_connection(&self) -> Result<TlsStream<TcpStream>> {
+        if let Some(pool) = &self.warm_pool {
+            if let Some(stream) = pool.try_get() {
+                return Ok(stream);
+            }
+        }
+        self.create_tls_connection().await
+    }
+
+    /// Spawn background warmup tasks
+    fn spawn_warmup(&self) {
+        let pool = match &self.warm_pool {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let connector = match &self.tls_connector {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let server_name = match &self.tls_server_name {
+            Some(s) => s.clone(),
+            None => return,
+        };
+
+        let batch_size = pool.warmup_batch_size();
+        for _ in 0..batch_size {
+            if !pool.start_warming() {
+                break;
+            }
+
+            let pool = pool.clone();
+            let connector = connector.clone();
+            let server_name = server_name.clone();
+            let resolver = self.dns_resolver.clone();
+            let server = self.server.clone();
+            let port = self.port;
+
+            tokio::spawn(async move {
+                let result = async {
+                    let ips = resolver.resolve_all(&server).await?;
+
+                    let mut tcp: Option<TcpStream> = None;
+                    for ip in ips {
+                        let addr = SocketAddr::new(ip, port);
+                        if let Ok(Ok(s)) = timeout(Duration::from_secs(3), TcpStream::connect(addr)).await {
+                            let _ = s.set_nodelay(true);
+                            #[cfg(unix)]
+                            {
+                                use socket2::SockRef;
+                                let _ = SockRef::from(&s).set_linger(Some(Duration::ZERO));
+                            }
+                            tcp = Some(s);
+                            break;
+                        }
+                    }
+                    let tcp = tcp.ok_or_else(|| Error::connection("warmup: no TCP"))?;
+
+                    timeout(Duration::from_secs(5), connector.connect(server_name, tcp))
+                        .await
+                        .map_err(|_| Error::tls("warmup: TLS timeout"))?
+                        .map_err(|e| Error::tls(format!("warmup: {}", e)))
+                }
+                .await;
+
+                pool.finish_warming();
+
+                if let Ok(stream) = result {
+                    pool.put(stream);
+                    debug!(protocol = "vless", phase = "warmup", "connection warmed");
+                }
+            });
+        }
+    }
+
+    /// Get pool statistics: (hit, miss, hit_rate%)
+    pub fn pool_stats(&self) -> (u64, u64, f64) {
+        self.warm_pool.as_ref()
+            .map(|p| p.stats())
+            .unwrap_or((0, 0, 0.0))
+    }
+
+    /// Print pool statistics to log
+    pub fn log_pool_stats(&self) {
+        let (hit, miss, rate) = self.pool_stats();
+        info!(
+            protocol = "vless",
+            name = %self.name,
+            pool_hit = hit,
+            pool_miss = miss,
+            hit_rate = format!("{:.1}%", rate),
+            "pool statistics"
+        );
     }
 }
 
@@ -264,110 +610,51 @@ impl OutboundProxy for Vless {
         let target_port = metadata.dst_port;
 
         debug!(
-            "[{}] VLESS connecting to {}:{} via {}:{}",
-            self.name, target_host, target_port, self.server, self.port
+            protocol = "vless",
+            name = %self.name,
+            dst = %format!("{}:{}", target_host, target_port),
+            pool = self.warm_pool.as_ref().map(|p| p.size()).unwrap_or(0),
+            "dial"
         );
 
-        // Connect to VLESS server
-        let timing_enabled = tracing::enabled!(Level::DEBUG);
-        let dns_start = if timing_enabled {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let resolved = self.dns_resolver.resolve(&self.server).await?;
-        if let Some(dns_start) = dns_start {
-            debug!(
-                protocol = "vless",
-                phase = "dns_resolve",
-                elapsed_ms = dns_start.elapsed().as_millis(),
-                "[{}] done",
-                self.name
-            );
-        }
-
-        let server_addr = std::net::SocketAddr::new(resolved, self.port);
-        let connect_start = if timing_enabled {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr))
-            .await
-            .map_err(|_| Error::timeout("VLESS connection timeout"))?
-            .map_err(|e| Error::connection(format!("Failed to connect to VLESS server: {}", e)))?;
-        if let Some(connect_start) = connect_start {
-            debug!(
-                protocol = "vless",
-                phase = "tcp_connect",
-                elapsed_ms = connect_start.elapsed().as_millis(),
-                "[{}] done",
-                self.name
-            );
-        }
-
-        stream.set_nodelay(true).ok();
-        Self::configure_socket(&stream);
-
-        // Build VLESS request
         let request = self.build_request(target_host.as_ref(), target_port, CMD_TCP);
 
         if self.tls {
-            // TLS connection
-            let connector = Self::create_tls_connector(self.skip_cert_verify)?;
-            let server_name = self.tls_server_name.clone().ok_or_else(|| {
-                Error::tls("Missing VLESS TLS server name")
-            })?;
+            let mut tls_stream = self.get_tls_connection().await?;
 
-            let tls_start = if timing_enabled {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            let mut tls_stream = connector
-                .connect(server_name, stream)
-                .await
-                .map_err(|e| Error::tls(format!("TLS handshake failed: {}", e)))?;
-            if let Some(tls_start) = tls_start {
-                debug!(
-                    protocol = "vless",
-                    phase = "tls_handshake",
-                    elapsed_ms = tls_start.elapsed().as_millis(),
-                    "[{}] done",
-                    self.name
-                );
+            if let Err(e) = tls_stream.write_all(&request).await {
+                warn!(protocol = "vless", err = %e, "retry with fresh connection");
+                tls_stream = self.create_tls_connection().await?;
+                tls_stream.write_all(&request).await
+                    .map_err(|e| Error::protocol(format!("header write: {}", e)))?;
             }
 
-            // Send VLESS request
-            let send_start = if timing_enabled {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            tls_stream
-                .write_all(&request)
-                .await
-                .map_err(|e| Error::connection(format!("Failed to send VLESS request: {}", e)))?;
-            if let Some(send_start) = send_start {
-                debug!(
-                    protocol = "vless",
-                    phase = "send_request",
-                    elapsed_ms = send_start.elapsed().as_millis(),
-                    "[{}] done",
-                    self.name
-                );
-            }
+            // Trigger background warmup
+            self.spawn_warmup();
 
-            debug!(
-                "[{}] VLESS connected to {}:{} (TLS)",
-                self.name, target_host, target_port
-            );
+            // Log pool stats every 1000 requests
+            if let Some(pool) = &self.warm_pool {
+                let (hit, miss, _) = pool.stats();
+                let total = hit + miss;
+                if total > 0 && total % 1000 == 0 {
+                    self.log_pool_stats();
+                }
+            }
 
             Ok(Box::new(VlessConnection::new(tls_stream)))
         } else {
             // Plain TCP (not recommended, but supported)
-            let mut tcp_stream = stream;
+            let resolved = self.dns_resolver.resolve(&self.server).await?;
+            let server_addr = SocketAddr::new(resolved, self.port);
+            let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr))
+                .await
+                .map_err(|_| Error::timeout("VLESS connection timeout"))?
+                .map_err(|e| Error::connection(format!("Failed to connect to VLESS server: {}", e)))?;
 
+            stream.set_nodelay(true).ok();
+            Self::configure_socket(&stream);
+
+            let mut tcp_stream = stream;
             tcp_stream
                 .write_all(&request)
                 .await
@@ -389,10 +676,6 @@ impl OutboundProxy for Vless {
 
 /// VLESS connection wrapper that strips the response header (version + addons)
 /// from the first read.
-///
-/// Xray may not send the response header until the upstream returns data. To
-/// avoid deadlocking CONNECT establishment, we consume it lazily on read rather
-/// than during `dial_tcp`.
 pub struct VlessConnection<S> {
     inner: S,
     response_header: [u8; 2],
@@ -524,9 +807,6 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        // Avoid initiating an active close (FIN) on high-churn VLESS upstream
-        // connections. With `SO_LINGER=0` on the underlying TCP socket this
-        // helps reduce TIME_WAIT pressure and ephemeral port exhaustion.
         match Pin::new(&mut self.inner).poll_flush(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),

@@ -13,7 +13,7 @@ pub use proxy::{ProxySetProvider, InlineProvider};
 pub use rule::{RuleProvider, RuleBehavior};
 
 use crate::outbound::OutboundProxy;
-use crate::{Error, Result};
+use crate::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

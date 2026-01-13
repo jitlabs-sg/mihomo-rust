@@ -1,7 +1,7 @@
 //! HTTP proxy inbound
 
 use super::InboundListener;
-use crate::common::{ConnType, Metadata, Network};
+use crate::common::Metadata;
 use crate::config::{AuthConfig, HttpInboundConfig};
 use crate::tunnel::Tunnel;
 use crate::{Error, Result};
@@ -10,9 +10,9 @@ use base64::Engine;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// HTTP proxy listener
 pub struct HttpListener {

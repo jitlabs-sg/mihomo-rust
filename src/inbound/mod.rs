@@ -1,8 +1,12 @@
 //! Inbound adapters (listeners)
 
 mod http;
+mod http_client;
+mod http_response;
 mod mixed;
 mod socks5;
+
+pub use http_client::PooledHttpClient;
 
 pub use http::HttpListener;
 pub use mixed::MixedListener;

@@ -201,24 +201,79 @@ fn increment_nonce(nonce: &mut [u8]) {
 /// Shadowsocks encrypted connection
 pub struct ShadowsocksConnection {
     inner: TcpStream,
-    cipher: CipherKind,
+    cipher_kind: CipherKind,
     master_key: Vec<u8>,
-    // Encryption state
-    enc_key: Vec<u8>,
-    enc_nonce: Vec<u8>,
+    // Encryption state - cached cipher instance
+    enc_cipher: CachedCipher,
+    enc_nonce: [u8; 12],
     enc_initialized: bool,
-    // Decryption state
-    dec_key: Option<Vec<u8>>,
-    dec_nonce: Vec<u8>,
+    // Decryption state - cached cipher instance
+    dec_cipher: Option<CachedCipher>,
+    dec_nonce: [u8; 12],
     dec_initialized: bool,
-    // Buffer
+    // Buffer - increased to 16KB for better throughput
     read_buf: BytesMut,
     pending_payload: BytesMut,
 }
 
+/// Cached cipher instance to avoid repeated creation
+enum CachedCipher {
+    Aes128Gcm(Aes128Gcm),
+    Aes256Gcm(Aes256Gcm),
+    ChaCha20Poly1305(ChaCha20Poly1305),
+}
+
+impl CachedCipher {
+    fn new(kind: CipherKind, key: &[u8]) -> Result<Self> {
+        match kind {
+            CipherKind::Aes128Gcm => {
+                let cipher = Aes128Gcm::new_from_slice(&key[..16])
+                    .map_err(|e| Error::crypto(e.to_string()))?;
+                Ok(CachedCipher::Aes128Gcm(cipher))
+            }
+            CipherKind::Aes256Gcm => {
+                let cipher = Aes256Gcm::new_from_slice(key)
+                    .map_err(|e| Error::crypto(e.to_string()))?;
+                Ok(CachedCipher::Aes256Gcm(cipher))
+            }
+            CipherKind::ChaCha20Poly1305 => {
+                let cipher = ChaCha20Poly1305::new_from_slice(key)
+                    .map_err(|e| Error::crypto(e.to_string()))?;
+                Ok(CachedCipher::ChaCha20Poly1305(cipher))
+            }
+        }
+    }
+
+    #[inline]
+    fn encrypt(&self, nonce: &[u8; 12], data: &[u8]) -> Result<Vec<u8>> {
+        let nonce = Nonce::from(*nonce);
+        match self {
+            CachedCipher::Aes128Gcm(c) => c.encrypt(&nonce, data)
+                .map_err(|e| Error::crypto(e.to_string())),
+            CachedCipher::Aes256Gcm(c) => c.encrypt(&nonce, data)
+                .map_err(|e| Error::crypto(e.to_string())),
+            CachedCipher::ChaCha20Poly1305(c) => c.encrypt(&nonce, data)
+                .map_err(|e| Error::crypto(e.to_string())),
+        }
+    }
+
+    #[inline]
+    fn decrypt(&self, nonce: &[u8; 12], data: &[u8]) -> Result<Vec<u8>> {
+        let nonce = Nonce::from(*nonce);
+        match self {
+            CachedCipher::Aes128Gcm(c) => c.decrypt(&nonce, data)
+                .map_err(|e| Error::crypto(e.to_string())),
+            CachedCipher::Aes256Gcm(c) => c.decrypt(&nonce, data)
+                .map_err(|e| Error::crypto(e.to_string())),
+            CachedCipher::ChaCha20Poly1305(c) => c.decrypt(&nonce, data)
+                .map_err(|e| Error::crypto(e.to_string())),
+        }
+    }
+}
+
 impl ShadowsocksConnection {
     pub async fn new(
-        mut inner: TcpStream,
+        inner: TcpStream,
         cipher: CipherKind,
         key: Vec<u8>,
         address: Address,
@@ -228,22 +283,23 @@ impl ShadowsocksConnection {
         let mut salt = vec![0u8; cipher.salt_size()];
         getrandom::getrandom(&mut salt).map_err(|e| Error::crypto(e.to_string()))?;
 
-        // Derive encryption subkey
+        // Derive encryption subkey and create cached cipher
         let enc_key = derive_subkey(&key, &salt);
+        let enc_cipher = CachedCipher::new(cipher, &enc_key)?;
 
-        // Create connection
+        // Create connection with larger buffers (16KB instead of 4KB)
         let mut conn = ShadowsocksConnection {
             inner,
-            cipher,
+            cipher_kind: cipher,
             master_key: key,
-            enc_key,
-            enc_nonce: vec![0u8; cipher.nonce_size()],
+            enc_cipher,
+            enc_nonce: [0u8; 12],
             enc_initialized: false,
-            dec_key: None,
-            dec_nonce: vec![0u8; cipher.nonce_size()],
+            dec_cipher: None,
+            dec_nonce: [0u8; 12],
             dec_initialized: false,
-            read_buf: BytesMut::with_capacity(4096),
-            pending_payload: BytesMut::new(),
+            read_buf: BytesMut::with_capacity(16 * 1024),
+            pending_payload: BytesMut::with_capacity(16 * 1024),
         };
 
         // Send salt + encrypted header (target address)
@@ -275,65 +331,18 @@ impl ShadowsocksConnection {
         Ok(result)
     }
 
+    #[inline]
     fn encrypt_chunk(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let nonce_arr: [u8; 12] = self.enc_nonce[..12].try_into().unwrap();
-
-        let encrypted = match self.cipher {
-            CipherKind::Aes128Gcm => {
-                let cipher = Aes128Gcm::new_from_slice(&self.enc_key[..16])
-                    .map_err(|e| Error::crypto(e.to_string()))?;
-                cipher
-                    .encrypt(&Nonce::from(nonce_arr), data)
-                    .map_err(|e| Error::crypto(e.to_string()))?
-            }
-            CipherKind::Aes256Gcm => {
-                let cipher = Aes256Gcm::new_from_slice(&self.enc_key)
-                    .map_err(|e| Error::crypto(e.to_string()))?;
-                cipher
-                    .encrypt(&Nonce::from(nonce_arr), data)
-                    .map_err(|e| Error::crypto(e.to_string()))?
-            }
-            CipherKind::ChaCha20Poly1305 => {
-                let cipher = ChaCha20Poly1305::new_from_slice(&self.enc_key)
-                    .map_err(|e| Error::crypto(e.to_string()))?;
-                cipher
-                    .encrypt(&Nonce::from(nonce_arr), data)
-                    .map_err(|e| Error::crypto(e.to_string()))?
-            }
-        };
-
+        let encrypted = self.enc_cipher.encrypt(&self.enc_nonce, data)?;
         increment_nonce(&mut self.enc_nonce);
         Ok(encrypted)
     }
 
+    #[inline]
     fn decrypt_chunk(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let dec_key = self.dec_key.as_ref().ok_or_else(|| Error::crypto("Decryption not initialized"))?;
-        let nonce_arr: [u8; 12] = self.dec_nonce[..12].try_into().unwrap();
-
-        let decrypted = match self.cipher {
-            CipherKind::Aes128Gcm => {
-                let cipher = Aes128Gcm::new_from_slice(&dec_key[..16])
-                    .map_err(|e| Error::crypto(e.to_string()))?;
-                cipher
-                    .decrypt(&Nonce::from(nonce_arr), data)
-                    .map_err(|e| Error::crypto(e.to_string()))?
-            }
-            CipherKind::Aes256Gcm => {
-                let cipher = Aes256Gcm::new_from_slice(dec_key)
-                    .map_err(|e| Error::crypto(e.to_string()))?;
-                cipher
-                    .decrypt(&Nonce::from(nonce_arr), data)
-                    .map_err(|e| Error::crypto(e.to_string()))?
-            }
-            CipherKind::ChaCha20Poly1305 => {
-                let cipher = ChaCha20Poly1305::new_from_slice(dec_key)
-                    .map_err(|e| Error::crypto(e.to_string()))?;
-                cipher
-                    .decrypt(&Nonce::from(nonce_arr), data)
-                    .map_err(|e| Error::crypto(e.to_string()))?
-            }
-        };
-
+        let dec_cipher = self.dec_cipher.as_ref()
+            .ok_or_else(|| Error::crypto("Decryption not initialized"))?;
+        let decrypted = dec_cipher.decrypt(&self.dec_nonce, data)?;
         increment_nonce(&mut self.dec_nonce);
         Ok(decrypted)
     }
@@ -352,8 +361,8 @@ impl AsyncRead for ShadowsocksConnection {
             return Poll::Ready(Ok(()));
         }
 
-        // Read from inner stream
-        let mut inner_buf = [0u8; 4096];
+        // Read from inner stream - use 16KB buffer for better throughput
+        let mut inner_buf = [0u8; 16 * 1024];
         let mut read_buf = ReadBuf::new(&mut inner_buf);
 
         match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
@@ -365,21 +374,28 @@ impl AsyncRead for ShadowsocksConnection {
 
                 self.read_buf.extend_from_slice(filled);
 
-                // Initialize decryption if needed (read salt)
+                // Initialize decryption if needed (read salt and create cached cipher)
                 if !self.dec_initialized {
-                    let salt_size = self.cipher.salt_size();
+                    let salt_size = self.cipher_kind.salt_size();
                     if self.read_buf.len() < salt_size {
                         return Poll::Pending;
                     }
                     let salt = self.read_buf.split_to(salt_size);
                     let dec_key = derive_subkey(&self.master_key, &salt);
-                    self.dec_key = Some(dec_key);
+                    // Create cached cipher for decryption
+                    match CachedCipher::new(self.cipher_kind, &dec_key) {
+                        Ok(cipher) => self.dec_cipher = Some(cipher),
+                        Err(e) => return Poll::Ready(Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            e.to_string(),
+                        ))),
+                    }
                     self.dec_initialized = true;
                 }
 
                 // Try to decrypt chunks
                 loop {
-                    let tag_size = self.cipher.tag_size();
+                    let tag_size = self.cipher_kind.tag_size();
                     // Need at least: encrypted_length (2 + tag)
                     let min_len = 2 + tag_size;
                     if self.read_buf.len() < min_len {

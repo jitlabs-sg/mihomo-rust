@@ -3,7 +3,6 @@
 use maxminddb::{geoip2, Reader};
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Arc;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 

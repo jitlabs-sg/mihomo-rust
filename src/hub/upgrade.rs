@@ -2,7 +2,7 @@
 //!
 //! Provides system control operations.
 
-use super::common::{ApiError, ApiResult};
+use super::common::ApiResult;
 use super::AppState;
 use axum::{
     extract::State,

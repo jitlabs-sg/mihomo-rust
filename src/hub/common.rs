@@ -6,7 +6,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 /// API error response
 #[derive(Debug, Clone, Serialize)]

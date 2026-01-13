@@ -4,10 +4,10 @@
 //! - Rust-handled proxies (native implementation)
 //! - Go-handled proxies (fallback to mihomo)
 
-use crate::config::{Config, ProxyConfig, ProxyGroupConfig};
+use crate::config::{Config, ProxyConfig};
 use crate::outbound::classifier::{classify_protocol, ProtocolTier};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use tokio::fs;
 use tracing::{debug, info};

@@ -7,12 +7,11 @@
 //! - Graceful shutdown
 
 use crate::{Error, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio::time::{interval, sleep, timeout};

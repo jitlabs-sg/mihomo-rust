@@ -4,7 +4,6 @@ use super::{DomainTrie, GeoIpReader};
 use crate::common::Metadata;
 use crate::{Error, Result};
 use ipnet::IpNet;
-use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::debug;
 

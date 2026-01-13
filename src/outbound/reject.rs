@@ -2,14 +2,12 @@
 
 use super::{OutboundProxy, ProxyConnection, ProxyType};
 use crate::common::Metadata;
-use crate::{Error, Result};
+use crate::Result;
 use async_trait::async_trait;
-use std::io::{self, ErrorKind};
+use std::io::{self};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::sleep;
 use tracing::debug;
 
 /// Reject connection - immediately closes or drops
@@ -104,7 +102,7 @@ struct DropConn;
 impl AsyncRead for DropConn {
     fn poll_read(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         _buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         // We can't directly sleep in poll_read, but we return Pending

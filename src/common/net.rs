@@ -3,19 +3,50 @@
 use crate::{Error, Result};
 use socket2::SockRef;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::buffer;
 
+/// Configure TCP stream for low-latency proxy workloads
 #[inline]
 pub fn configure_tcp_stream(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
     let sock = SockRef::from(stream);
+
+    // Enable keepalive with aggressive timings for proxy connections
     let _ = sock.set_keepalive(true);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let keepalive = keepalive.with_retries(3);
+        let _ = sock.set_tcp_keepalive(&keepalive);
+    }
+
     let _ = sock.set_reuse_address(true);
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let _ = sock.set_reuse_port(true);
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = sock.set_reuse_port(true);
+        // TCP_QUICKACK: disable delayed ACK for lower latency
+        // This reduces p99 latency by avoiding 40ms ACK delay
+        unsafe {
+            let fd = stream.as_raw_fd();
+            let optval: libc::c_int = 1;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
 }
 
 /// SOCKS5 address type

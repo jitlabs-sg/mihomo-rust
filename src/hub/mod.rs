@@ -44,7 +44,6 @@ use crate::tunnel::Tunnel;
 use crate::{Result, VERSION, META};
 
 use axum::{
-    extract::State,
     middleware,
     routing::{delete, get, patch, post, put},
     Json, Router,

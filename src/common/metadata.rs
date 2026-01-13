@@ -1,7 +1,7 @@
 //! Connection metadata
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Network type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

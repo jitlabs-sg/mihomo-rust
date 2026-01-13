@@ -127,7 +127,7 @@ pub async fn patch_configs(
 
 /// POST /configs/geo - Update GeoIP/GeoSite databases
 pub async fn update_geo(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
 ) -> ApiResult<StatusCode> {
     info!("Updating GeoIP databases");
 

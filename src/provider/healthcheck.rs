@@ -70,8 +70,8 @@ impl HealthCheck {
         let futures: Vec<_> = proxies
             .iter()
             .map(|proxy| {
-                let url = self.url.clone();
-                let expected = self.expected_status.clone();
+                let _url = self.url.clone();
+                let _expected = self.expected_status.clone();
                 let proxy = proxy.clone();
 
                 async move {

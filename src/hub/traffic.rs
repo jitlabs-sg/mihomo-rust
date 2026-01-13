@@ -10,7 +10,7 @@ use axum::{
     },
     response::Response,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::json;
 use std::time::Duration;
 use tracing::debug;

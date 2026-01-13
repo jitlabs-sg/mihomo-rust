@@ -15,7 +15,6 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// Statistics manager for connections and traffic

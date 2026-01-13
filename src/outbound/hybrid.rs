@@ -5,15 +5,14 @@
 
 use super::classifier::{classify_protocol, ProtocolTier};
 use super::go_fallback::{GoFallbackManager, GoFallbackStats, ManagerState, ProcessState};
-use super::{OutboundProxy, ProxyManager, ProxyType};
+use super::{OutboundProxy, ProxyManager};
 use crate::config::ProxyConfig;
 use crate::dns::Resolver;
-use crate::{Error, Result};
-use std::collections::HashMap;
+use crate::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 /// Hybrid proxy manager combining Rust native and Go fallback proxies
 pub struct HybridProxyManager {

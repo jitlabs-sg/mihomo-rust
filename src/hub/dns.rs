@@ -2,7 +2,7 @@
 //!
 //! Provides DNS query and cache management.
 
-use super::common::{ApiError, ApiResult, DnsQueryParams};
+use super::common::{ApiResult, DnsQueryParams};
 use super::AppState;
 use axum::{
     extract::{Query, State},
