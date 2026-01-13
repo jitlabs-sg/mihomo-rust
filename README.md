@@ -80,19 +80,25 @@ Pre-established TLS connection pool with predictive warmup:
 >
 > Full stability report (memory growth, GC effects, connection pool leaks) coming after 24h.
 
-### Preliminary Results (5-minute burst test)
+### Multi-Region Performance (4 AWS regions → GCP)
 
 **Test Setup**: 1000 requests, 50 concurrent connections, via GCP us-central1 xray server
 
 | Protocol | mihomo-rust | mihomo-go | Improvement |
 |----------|-------------|-----------|-------------|
-| VMess | 101.4 RPS | 61.1 RPS | **+66%** |
-| SOCKS5 | 96.5 RPS | 59.8 RPS | **+62%** |
-| VLESS | 88.1 RPS | 58.2 RPS | **+51%** |
-| Trojan | 88.0 RPS | 61.8 RPS | **+42%** |
-| HTTP | 87.1 RPS | 68.3 RPS | **+28%** |
-| Shadowsocks | 90.9 RPS | 78.1 RPS | **+16%** |
-| **Average** | **92.0 RPS** | **64.5 RPS** | **+42.6%** |
+| HTTP | 151.2 RPS | 66.9 RPS | **+126%** |
+| SOCKS5 | 146.1 RPS | 76.3 RPS | **+91%** |
+| VMess | 109.8 RPS | 58.2 RPS | **+89%** |
+| VLESS | 113.2 RPS | 70.6 RPS | **+60%** |
+| Shadowsocks | 118.8 RPS | 82.4 RPS | **+44%** |
+| Trojan | 110.0 RPS | 75.3 RPS | **+46%** |
+| **Average** | **124.9 RPS** | **71.6 RPS** | **+74%** |
+
+**Regional Breakdown**:
+- Singapore (ap-southeast-1): Rust leads by 2-5x (SOCKS5: 220 RPS vs 54 RPS)
+- Tokyo (ap-northeast-1): Rust leads by 15-35% across all protocols
+- US East (us-east-1): Rust leads by 5-400% (VMess: 135 RPS vs 27 RPS)
+- EU West (eu-west-1): Rust leads by 35-540% (HTTP: 114 RPS vs 18 RPS)
 
 ### Latency Distribution (VMess, Singapore → GCP)
 
