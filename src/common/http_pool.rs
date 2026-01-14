@@ -8,9 +8,7 @@ use crate::outbound::ProxyConnection;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, trace};
 
 /// Default maximum connections per target

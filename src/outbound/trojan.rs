@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha224};
-use socket2::SockRef;
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
@@ -369,7 +368,10 @@ impl Trojan {
                 Ok(Ok(s)) => {
                     let _ = s.set_nodelay(true);
                     #[cfg(unix)]
-                    let _ = SockRef::from(&s).set_linger(Some(Duration::ZERO));
+                    {
+                        use socket2::SockRef;
+                        let _ = SockRef::from(&s).set_linger(Some(Duration::ZERO));
+                    }
                     tcp_stream = Some(s);
                     break;
                 }
@@ -433,7 +435,10 @@ impl Trojan {
                         if let Ok(Ok(s)) = timeout(Duration::from_secs(3), TcpStream::connect(addr)).await {
                             let _ = s.set_nodelay(true);
                             #[cfg(unix)]
-                            let _ = SockRef::from(&s).set_linger(Some(Duration::ZERO));
+                            {
+                                use socket2::SockRef;
+                                let _ = SockRef::from(&s).set_linger(Some(Duration::ZERO));
+                            }
                             tcp = Some(s);
                             break;
                         }
@@ -569,7 +574,8 @@ impl OutboundProxy for Trojan {
         // Log pool stats every 1000 requests
         let (hit, miss, _) = self.warm_pool.stats();
         let total = hit + miss;
-        if total > 0 && total % 1000 == 0 {
+        let every = super::pool_stats_log_every();
+        if total > 0 && total % every == 0 {
             self.log_pool_stats();
         }
 

@@ -1,5 +1,6 @@
 //! Shadowsocks outbound protocol
 
+use super::tcp_warm_pool::{TcpPoolConfig, TcpWarmPool};
 use super::{OutboundProxy, ProxyConnection, ProxyType};
 use crate::common::net::Address;
 use crate::common::Metadata;
@@ -19,9 +20,16 @@ use std::io::{self, ErrorKind};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tracing::debug;
+use tokio::time::timeout;
+use tracing::{debug, info, warn};
+
+const DEFAULT_POOL_SIZE: usize = 16;
+const DEFAULT_POOL_MAX_IDLE_SECS: u64 = 10;
+const DEFAULT_WARMUP_BATCH_SIZE: usize = 4;
+const TCP_SETUP_LATENCY_MS: u64 = 200;
 
 /// Shadowsocks cipher type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +83,7 @@ pub struct Shadowsocks {
     key: Vec<u8>,
     udp: bool,
     dns_resolver: Arc<Resolver>,
+    warm_pool: Arc<TcpWarmPool>,
 }
 
 impl Shadowsocks {
@@ -89,6 +98,15 @@ impl Shadowsocks {
     ) -> Result<Self> {
         let cipher_kind = CipherKind::try_from(cipher.as_str())?;
         let key = derive_key(&password, cipher_kind.key_size());
+        let warm_pool = Arc::new(TcpWarmPool::new(
+            "shadowsocks",
+            TcpPoolConfig::new(
+                DEFAULT_POOL_SIZE,
+                DEFAULT_POOL_MAX_IDLE_SECS,
+                DEFAULT_WARMUP_BATCH_SIZE,
+                TCP_SETUP_LATENCY_MS,
+            ),
+        ));
 
         Ok(Shadowsocks {
             name,
@@ -98,11 +116,75 @@ impl Shadowsocks {
             key,
             udp,
             dns_resolver,
+            warm_pool,
         })
     }
 
     fn server_addr(&self) -> String {
         format!("{}:{}", self.server, self.port)
+    }
+
+    fn pool_stats(&self) -> (u64, u64, f64) {
+        self.warm_pool.stats()
+    }
+
+    fn log_pool_stats(&self) {
+        let (hit, miss, rate) = self.pool_stats();
+        info!(
+            protocol = "shadowsocks",
+            name = %self.name,
+            pool_hit = hit,
+            pool_miss = miss,
+            hit_rate = format!("{:.1}%", rate),
+            "pool statistics"
+        );
+    }
+
+    fn spawn_warmup(&self) {
+        let batch_size = self.warm_pool.warmup_batch_size();
+        for _ in 0..batch_size {
+            if !self.warm_pool.start_warming() {
+                break;
+            }
+
+            let pool = self.warm_pool.clone();
+            let resolver = self.dns_resolver.clone();
+            let server = self.server.clone();
+            let port = self.port;
+
+            tokio::spawn(async move {
+                let result = async {
+                    let resolved = resolver.resolve(&server).await?;
+                    let addr = format!("{}:{}", resolved, port);
+                    let stream = match timeout(Duration::from_secs(3), TcpStream::connect(&addr))
+                        .await
+                    {
+                        Ok(res) => res.map_err(|e| {
+                            Error::connection(format!("warmup: TCP connect ({}): {}", addr, e))
+                        })?,
+                        Err(_) => {
+                            return Err(Error::timeout(format!(
+                                "warmup: TCP timeout ({})",
+                                addr
+                            )))
+                        }
+                    };
+                    Ok(stream)
+                }
+                .await;
+
+                pool.finish_warming();
+
+                if let Ok(stream) = result {
+                    pool.put(stream);
+                    debug!(
+                        protocol = "shadowsocks",
+                        phase = "warmup",
+                        "connection warmed"
+                    );
+                }
+            });
+        }
     }
 }
 
@@ -127,30 +209,67 @@ impl OutboundProxy for Shadowsocks {
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConnection>> {
         let server_addr = self.server_addr();
         debug!(
-            "Shadowsocks {} connecting to {} via {}",
-            self.name,
-            metadata.remote_address(),
-            server_addr
+            protocol = "shadowsocks",
+            name = %self.name,
+            dst = %metadata.remote_address(),
+            pool = self.warm_pool.size(),
+            server = %server_addr,
+            "dial"
         );
 
         // Resolve server address if needed
         let resolved_addr = self.dns_resolver.resolve(&self.server).await?;
         let addr = format!("{}:{}", resolved_addr, self.port);
 
-        // Connect to shadowsocks server
-        let stream = TcpStream::connect(&addr)
-            .await
-            .map_err(|e| Error::connection(format!("Failed to connect to SS server: {}", e)))?;
+        let stream = if let Some(stream) = self.warm_pool.try_get() {
+            stream
+        } else {
+            TcpStream::connect(&addr)
+                .await
+                .map_err(|e| {
+                    Error::connection(format!("Failed to connect to SS server: {}", e))
+                })?
+        };
 
-        // Create encrypted connection
-        let conn = ShadowsocksConnection::new(
+        let dest_addr = Address::from(metadata.destination());
+        let conn = match ShadowsocksConnection::new(
             stream,
             self.cipher,
             self.key.clone(),
-            Address::from(metadata.destination()),
+            dest_addr.clone(),
             metadata.dst_port,
         )
-        .await?;
+        .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!(
+                    protocol = "shadowsocks",
+                    err = %e,
+                    "handshake failed, retrying with fresh connection"
+                );
+                let stream = TcpStream::connect(&addr).await.map_err(|err| {
+                    Error::connection(format!("Failed to connect to SS server: {}", err))
+                })?;
+                ShadowsocksConnection::new(
+                    stream,
+                    self.cipher,
+                    self.key.clone(),
+                    dest_addr,
+                    metadata.dst_port,
+                )
+                .await?
+            }
+        };
+
+        self.spawn_warmup();
+
+        let (hit, miss, _) = self.pool_stats();
+        let total = hit + miss;
+        let every = super::pool_stats_log_every();
+        if total > 0 && total % every == 0 {
+            self.log_pool_stats();
+        }
 
         debug!(
             "Shadowsocks {} connected to {}",

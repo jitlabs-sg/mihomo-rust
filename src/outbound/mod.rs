@@ -11,6 +11,7 @@ pub mod hybrid;
 mod hysteria2;
 mod reject;
 mod shadowsocks;
+mod tcp_warm_pool;
 mod trojan;
 mod http;
 mod socks5;
@@ -40,8 +41,19 @@ use crate::{Error, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+fn pool_stats_log_every() -> u64 {
+    static EVERY: OnceLock<u64> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("MIHOMO_POOL_STATS_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1000)
+    })
+}
 /// Proxy type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProxyType {
@@ -190,6 +202,10 @@ impl ProxyManager {
                 let tls = config.get_bool("tls").unwrap_or(false);
                 let network = config.get_string("network").unwrap_or_else(|| "tcp".to_string());
                 let server_name = config.get_string("servername");
+                let time_offset_secs = config
+                    .get_int("time-offset")
+                    .or_else(|| config.get_int("time_offset"))
+                    .unwrap_or(0);
 
                 Ok(Arc::new(Vmess::new(
                     config.name.clone(),
@@ -202,6 +218,7 @@ impl ProxyManager {
                     tls,
                     network,
                     server_name,
+                    time_offset_secs,
                     dns_resolver,
                 )?))
             }

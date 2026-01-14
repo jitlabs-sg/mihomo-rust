@@ -5,7 +5,7 @@
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, trace};
+use tracing::trace;
 
 /// Maximum response header size (32KB)
 const MAX_RESPONSE_HEADER_SIZE: usize = 32 * 1024;

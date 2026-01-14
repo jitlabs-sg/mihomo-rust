@@ -636,7 +636,8 @@ impl OutboundProxy for Vless {
             if let Some(pool) = &self.warm_pool {
                 let (hit, miss, _) = pool.stats();
                 let total = hit + miss;
-                if total > 0 && total % 1000 == 0 {
+                let every = super::pool_stats_log_every();
+                if total > 0 && total % every == 0 {
                     self.log_pool_stats();
                 }
             }

@@ -1,10 +1,12 @@
 //! VMess outbound protocol
+use super::tcp_warm_pool::{TcpPoolConfig, TcpWarmPool};
 use super::{OutboundProxy, ProxyConnection, ProxyType};
 use crate::common::net::Address;
 use crate::common::Metadata;
 use crate::dns::Resolver;
 use crate::{Error, Result};
 
+use aead::{AeadInPlace, Buffer as AeadBuffer};
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit as BlockKeyInit};
 use aes::Aes128;
 use aes_gcm::aead::{Aead, Payload};
@@ -13,6 +15,7 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
 use crc32fast::Hasher as Crc32Hasher;
+use hmac::{Hmac, Mac};
 use md5::{Digest as Md5Digest, Md5};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -26,7 +29,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tracing::{debug, error};
+use tokio::time::timeout;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const VMESS_VERSION: u8 = 1;
@@ -44,6 +48,11 @@ const CIPHER_OVERHEAD: usize = 16;
 const WRITE_CHUNK_SIZE: usize = 15000;
 const RESPONSE_HEADER_LEN_CIPHER_LEN: usize = 2 + CIPHER_OVERHEAD;
 const RESPONSE_HEADER_READ_CHUNK: usize = 4096;
+
+const DEFAULT_POOL_SIZE: usize = 16;
+const DEFAULT_POOL_MAX_IDLE_SECS: u64 = 10;
+const DEFAULT_WARMUP_BATCH_SIZE: usize = 4;
+const TCP_SETUP_LATENCY_MS: u64 = 200;
 
 const KDF_ROOT: &[u8] = b"VMess AEAD KDF";
 
@@ -148,7 +157,9 @@ pub struct Vmess {
     tls: bool,
     network: String,
     server_name: Option<String>,
+    time_offset_secs: i64,
     dns_resolver: Arc<Resolver>,
+    warm_pool: Arc<TcpWarmPool>,
 }
 
 impl Vmess {
@@ -164,11 +175,21 @@ impl Vmess {
         tls: bool,
         network: String,
         server_name: Option<String>,
+        time_offset_secs: i64,
         dns_resolver: Arc<Resolver>,
     ) -> Result<Self> {
         let uuid = Uuid::parse_str(&uuid_str)
             .map_err(|e| Error::config(format!("Invalid VMess UUID: {}", e)))?;
         let security_type = VmessSecurity::try_from(security.as_str())?;
+        let warm_pool = Arc::new(TcpWarmPool::new(
+            "vmess",
+            TcpPoolConfig::new(
+                DEFAULT_POOL_SIZE,
+                DEFAULT_POOL_MAX_IDLE_SECS,
+                DEFAULT_WARMUP_BATCH_SIZE,
+                TCP_SETUP_LATENCY_MS,
+            ),
+        ));
 
         Ok(Vmess {
             name,
@@ -181,13 +202,114 @@ impl Vmess {
             tls,
             network,
             server_name,
+            time_offset_secs,
             dns_resolver,
+            warm_pool,
         })
     }
 
     fn server_addr(&self) -> String {
         format!("{}:{}", self.server, self.port)
     }
+
+    fn pool_stats(&self) -> (u64, u64, f64) {
+        self.warm_pool.stats()
+    }
+
+    fn log_pool_stats(&self) {
+        let (hit, miss, rate) = self.pool_stats();
+        info!(
+            protocol = "vmess",
+            name = %self.name,
+            pool_hit = hit,
+            pool_miss = miss,
+            hit_rate = format!("{:.1}%", rate),
+            "pool statistics"
+        );
+    }
+
+    fn spawn_warmup(&self) {
+        let batch_size = self.warm_pool.warmup_batch_size();
+        for _ in 0..batch_size {
+            if !self.warm_pool.start_warming() {
+                break;
+            }
+
+            let pool = self.warm_pool.clone();
+            let resolver = self.dns_resolver.clone();
+            let server = self.server.clone();
+            let port = self.port;
+
+            tokio::spawn(async move {
+                let result = async {
+                    let resolved = resolver.resolve(&server).await?;
+                    let addr = format!("{}:{}", resolved, port);
+                    let stream = match timeout(Duration::from_secs(3), async {
+                        connect_tcp_with_retry(&addr).await
+                    })
+                    .await
+                    {
+                        Ok(res) => res?,
+                        Err(_) => {
+                            return Err(Error::timeout(format!(
+                                "warmup: TCP timeout ({})",
+                                addr
+                            )))
+                        }
+                    };
+                    Ok(stream)
+                }
+                .await;
+
+                pool.finish_warming();
+
+                if let Ok(stream) = result {
+                    pool.put(stream);
+                    debug!(protocol = "vmess", phase = "warmup", "connection warmed");
+                }
+            });
+        }
+    }
+}
+
+async fn connect_tcp_with_retry(addr: &str) -> Result<TcpStream> {
+    let mut attempt: u32 = 0;
+    let max_attempts: u32 = 10;
+    let stream = loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => break stream,
+            Err(e) if e.kind() == ErrorKind::AddrNotAvailable && attempt < max_attempts => {
+                attempt += 1;
+                debug!(
+                    protocol = "vmess",
+                    phase = "tcp_connect_retry",
+                    server = %addr,
+                    attempt,
+                    err = ?e,
+                    "connect failed, retrying"
+                );
+                let backoff_ms = 5u64.saturating_mul(attempt as u64).min(50);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            Err(e) => {
+                error!(
+                    protocol = "vmess",
+                    phase = "tcp_connect",
+                    server = %addr,
+                    err = ?e,
+                    "connect failed"
+                );
+                return Err(Error::connection(format!(
+                    "Failed to connect to VMess server: {}",
+                    e
+                )));
+            }
+        }
+    };
+
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_linger(Some(Duration::from_secs(0)));
+    Ok(stream)
 }
 
 #[async_trait]
@@ -226,10 +348,12 @@ impl OutboundProxy for Vmess {
 
         let server_addr = self.server_addr();
         debug!(
-            "VMess {} connecting to {} via {}",
-            self.name,
-            metadata.remote_address(),
-            server_addr
+            protocol = "vmess",
+            name = %self.name,
+            dst = %metadata.remote_address(),
+            pool = self.warm_pool.size(),
+            server = %server_addr,
+            "dial"
         );
 
         let resolved_addr = self
@@ -247,41 +371,11 @@ impl OutboundProxy for Vmess {
                 e
             })?;
         let addr = format!("{}:{}", resolved_addr, self.port);
-        let mut attempt: u32 = 0;
-        let max_attempts: u32 = 10;
-        let stream = loop {
-            match TcpStream::connect(&addr).await {
-                Ok(stream) => break stream,
-                Err(e) if e.kind() == ErrorKind::AddrNotAvailable && attempt < max_attempts => {
-                    attempt += 1;
-                    debug!(
-                        protocol = "vmess",
-                        phase = "tcp_connect_retry",
-                        server = %addr,
-                        attempt,
-                        err = ?e,
-                        "connect failed, retrying"
-                    );
-                    let backoff_ms = 5u64.saturating_mul(attempt as u64).min(50);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                }
-                Err(e) => {
-                    error!(
-                        protocol = "vmess",
-                        phase = "tcp_connect",
-                        server = %addr,
-                        err = ?e,
-                        "connect failed"
-                    );
-                    return Err(Error::connection(format!(
-                        "Failed to connect to VMess server: {}",
-                        e
-                    )));
-                }
-            }
+        let stream = if let Some(stream) = self.warm_pool.try_get() {
+            stream
+        } else {
+            connect_tcp_with_retry(&addr).await?
         };
-        let _ = stream.set_nodelay(true);
-        let _ = stream.set_linger(Some(Duration::from_secs(0)));
 
         let dest_addr = Address::from(metadata.destination());
         let security = resolve_security(self.security);
@@ -293,9 +387,44 @@ impl OutboundProxy for Vmess {
             "setup"
         );
 
-        let conn =
-            VmessConnection::connect(stream, cmd_key, security, dest_addr, metadata.dst_port)
-                .await?;
+        let conn = match VmessConnection::connect(
+            stream,
+            cmd_key,
+            security,
+            dest_addr.clone(),
+            metadata.dst_port,
+            self.time_offset_secs,
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!(
+                    protocol = "vmess",
+                    err = %e,
+                    "handshake failed, retrying with fresh connection"
+                );
+                let stream = connect_tcp_with_retry(&addr).await?;
+                VmessConnection::connect(
+                    stream,
+                    cmd_key,
+                    security,
+                    dest_addr,
+                    metadata.dst_port,
+                    self.time_offset_secs,
+                )
+                .await?
+            }
+        };
+
+        self.spawn_warmup();
+
+        let (hit, miss, _) = self.pool_stats();
+        let total = hit + miss;
+        let every = super::pool_stats_log_every();
+        if total > 0 && total % every == 0 {
+            self.log_pool_stats();
+        }
 
         debug!(
             "VMess {} connected to {}",
@@ -306,171 +435,80 @@ impl OutboundProxy for Vmess {
     }
 }
 
-trait DynHash: Send + Sync {
-    fn update(&mut self, data: &[u8]);
-    fn finalize(self: Box<Self>) -> Vec<u8>;
-    fn block_size(&self) -> usize;
-    fn output_size(&self) -> usize;
-}
+fn vmess_kdf(key: &[u8], salt: &[u8], path: &[&[u8]]) -> [u8; 32] {
+    const BLOCK_SIZE: usize = 64;
+    const OUTPUT_SIZE: usize = 32;
+    const MAX_KEYS: usize = 16;
+    const MAX_PARTS: usize = 16;
 
-trait DynHashFactory: Send + Sync {
-    fn create(&self) -> Box<dyn DynHash>;
-    fn block_size(&self) -> usize;
-    fn output_size(&self) -> usize;
-}
+    const EMPTY: &[u8] = &[];
 
-struct Sha256Factory;
+    type HmacSha256 = Hmac<Sha256>;
 
-impl DynHashFactory for Sha256Factory {
-    fn create(&self) -> Box<dyn DynHash> {
-        Box::new(Sha256Hash {
-            hasher: Sha256::new(),
-        })
-    }
-
-    fn block_size(&self) -> usize {
-        64
-    }
-
-    fn output_size(&self) -> usize {
-        32
-    }
-}
-
-struct Sha256Hash {
-    hasher: Sha256,
-}
-
-impl DynHash for Sha256Hash {
-    fn update(&mut self, data: &[u8]) {
-        Sha2Digest::update(&mut self.hasher, data);
-    }
-
-    fn finalize(self: Box<Self>) -> Vec<u8> {
-        let Sha256Hash { hasher } = *self;
-        hasher.finalize().to_vec()
-    }
-
-    fn block_size(&self) -> usize {
-        64
-    }
-
-    fn output_size(&self) -> usize {
-        32
-    }
-}
-
-struct HmacFactory {
-    key: Vec<u8>,
-    inner: Arc<dyn DynHashFactory>,
-}
-
-impl HmacFactory {
-    fn new(key: &[u8], inner: Arc<dyn DynHashFactory>) -> Self {
-        Self {
-            key: key.to_vec(),
-            inner,
+    fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; OUTPUT_SIZE] {
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts keys of any size");
+        for part in parts {
+            mac.update(part);
         }
-    }
-}
-
-impl DynHashFactory for HmacFactory {
-    fn create(&self) -> Box<dyn DynHash> {
-        Box::new(DynHmac::new(self.key.clone(), self.inner.clone()))
+        let bytes = mac.finalize().into_bytes();
+        let mut out = [0u8; OUTPUT_SIZE];
+        out.copy_from_slice(&bytes);
+        out
     }
 
-    fn block_size(&self) -> usize {
-        self.inner.block_size()
-    }
-
-    fn output_size(&self) -> usize {
-        self.inner.output_size()
-    }
-}
-
-struct DynHmac {
-    inner_factory: Arc<dyn DynHashFactory>,
-    inner: Box<dyn DynHash>,
-    opad: Vec<u8>,
-}
-
-impl DynHmac {
-    fn new(key: Vec<u8>, inner_factory: Arc<dyn DynHashFactory>) -> Self {
-        let block_size = inner_factory.block_size();
-        let key = if key.len() > block_size {
-            let mut h = inner_factory.create();
-            h.update(&key);
-            h.finalize()
+    fn pads(level: usize, keys: &[&[u8]], key: &[u8]) -> ([u8; BLOCK_SIZE], [u8; BLOCK_SIZE]) {
+        let mut key_block = [0u8; BLOCK_SIZE];
+        if key.len() > BLOCK_SIZE {
+            let digest = nested_hash(level - 1, keys, &[key]);
+            key_block[..OUTPUT_SIZE].copy_from_slice(&digest);
         } else {
-            key
-        };
+            key_block[..key.len()].copy_from_slice(key);
+        }
 
-        let mut key_block = vec![0u8; block_size];
-        key_block[..key.len()].copy_from_slice(&key);
-
-        let mut ipad = key_block.clone();
+        let mut ipad = key_block;
+        let mut opad = key_block;
         for b in &mut ipad {
             *b ^= 0x36;
         }
-
-        let mut opad = key_block;
         for b in &mut opad {
             *b ^= 0x5c;
         }
+        (ipad, opad)
+    }
 
-        let mut inner = inner_factory.create();
-        inner.update(&ipad);
-
-        Self {
-            inner_factory,
-            inner,
-            opad,
+    fn nested_hash(level: usize, keys: &[&[u8]], parts: &[&[u8]]) -> [u8; OUTPUT_SIZE] {
+        if level == 0 {
+            return hmac_sha256(keys[0], parts);
         }
-    }
-}
 
-impl DynHash for DynHmac {
-    fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
-    }
+        let (ipad, opad) = pads(level, keys, keys[level]);
 
-    fn finalize(self: Box<Self>) -> Vec<u8> {
-        let DynHmac {
-            inner_factory,
-            inner,
-            opad,
-        } = *self;
+        let mut inner_parts = [EMPTY; MAX_PARTS];
+        inner_parts[0] = &ipad;
+        for (i, part) in parts.iter().enumerate() {
+            inner_parts[i + 1] = part;
+        }
+        let inner_len = 1 + parts.len();
+        debug_assert!(inner_len <= MAX_PARTS);
 
-        let inner_sum = inner.finalize();
-
-        let mut outer = inner_factory.create();
-        outer.update(&opad);
-        outer.update(&inner_sum);
-        outer.finalize()
+        let inner_sum = nested_hash(level - 1, keys, &inner_parts[..inner_len]);
+        let outer_parts = [&opad[..], &inner_sum[..]];
+        nested_hash(level - 1, keys, &outer_parts)
     }
 
-    fn block_size(&self) -> usize {
-        self.inner_factory.block_size()
-    }
-
-    fn output_size(&self) -> usize {
-        self.inner_factory.output_size()
-    }
-}
-
-fn vmess_kdf(key: &[u8], salt: &[u8], path: &[&[u8]]) -> [u8; 32] {
-    let mut factory: Arc<dyn DynHashFactory> =
-        Arc::new(HmacFactory::new(KDF_ROOT, Arc::new(Sha256Factory)));
-    factory = Arc::new(HmacFactory::new(salt, factory));
+    let mut keys_arr = [EMPTY; MAX_KEYS];
+    keys_arr[0] = KDF_ROOT;
+    keys_arr[1] = salt;
+    let mut keys_len = 2;
     for p in path {
-        factory = Arc::new(HmacFactory::new(p, factory));
+        keys_arr[keys_len] = p;
+        keys_len += 1;
     }
+    debug_assert!(keys_len <= MAX_KEYS);
 
-    let mut h = factory.create();
-    h.update(key);
-    let out = h.finalize();
-    out.try_into()
-        .unwrap_or_else(|_| unreachable!("sha256 output size mismatch"))
+    let msg_parts = [key];
+    nested_hash(keys_len - 1, &keys_arr[..keys_len], &msg_parts)
 }
 
 fn derive_cmd_key(uuid: &Uuid) -> [u8; 16] {
@@ -523,6 +561,14 @@ fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&block);
     out
+}
+
+fn vmess_timestamp_secs(offset_secs: i64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    now.saturating_add(offset_secs).max(0)
 }
 
 fn fnv1a_hash(data: &[u8]) -> u32 {
@@ -618,6 +664,48 @@ enum VmessBodyCipher {
     ChaCha20Poly1305(ChaCha20Poly1305),
 }
 
+struct TailBuffer<'a> {
+    buf: &'a mut BytesMut,
+    start: usize,
+}
+
+impl<'a> TailBuffer<'a> {
+    fn new(buf: &'a mut BytesMut, start: usize) -> Self {
+        Self { buf, start }
+    }
+}
+
+impl AsRef<[u8]> for TailBuffer<'_> {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+}
+
+impl AsMut<[u8]> for TailBuffer<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[self.start..]
+    }
+}
+
+impl AeadBuffer for TailBuffer<'_> {
+    fn len(&self) -> usize {
+        self.buf.len().saturating_sub(self.start)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn extend_from_slice(&mut self, other: &[u8]) -> aead::Result<()> {
+        self.buf.extend_from_slice(other);
+        Ok(())
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.buf.truncate(self.start + len);
+    }
+}
+
 impl VmessBodyCipher {
     fn overhead(&self) -> usize {
         match self {
@@ -626,26 +714,26 @@ impl VmessBodyCipher {
         }
     }
 
-    fn encrypt(&self, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>> {
+    fn encrypt_in_place<B: AeadBuffer>(&self, nonce: &[u8; 12], buf: &mut B) -> Result<()> {
         match self {
-            VmessBodyCipher::None => Ok(plaintext.to_vec()),
+            VmessBodyCipher::None => Ok(()),
             VmessBodyCipher::Aes128Gcm(cipher) => cipher
-                .encrypt(Nonce::from_slice(nonce), plaintext)
+                .encrypt_in_place(Nonce::from_slice(nonce), b"", buf)
                 .map_err(|e| Error::crypto(e.to_string())),
             VmessBodyCipher::ChaCha20Poly1305(cipher) => cipher
-                .encrypt(chacha20poly1305::Nonce::from_slice(nonce), plaintext)
+                .encrypt_in_place(chacha20poly1305::Nonce::from_slice(nonce), b"", buf)
                 .map_err(|e| Error::crypto(e.to_string())),
         }
     }
 
-    fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_in_place<B: AeadBuffer>(&self, nonce: &[u8; 12], buf: &mut B) -> Result<()> {
         match self {
-            VmessBodyCipher::None => Ok(ciphertext.to_vec()),
+            VmessBodyCipher::None => Ok(()),
             VmessBodyCipher::Aes128Gcm(cipher) => cipher
-                .decrypt(Nonce::from_slice(nonce), ciphertext)
+                .decrypt_in_place(Nonce::from_slice(nonce), b"", buf)
                 .map_err(|e| Error::crypto(e.to_string())),
             VmessBodyCipher::ChaCha20Poly1305(cipher) => cipher
-                .decrypt(chacha20poly1305::Nonce::from_slice(nonce), ciphertext)
+                .decrypt_in_place(chacha20poly1305::Nonce::from_slice(nonce), b"", buf)
                 .map_err(|e| Error::crypto(e.to_string())),
         }
     }
@@ -742,14 +830,14 @@ impl VmessBodyCodec {
         nonce
     }
 
-    fn encrypt_chunk(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    fn encrypt_in_place<B: AeadBuffer>(&mut self, buf: &mut B) -> Result<()> {
         let nonce = self.next_nonce();
-        self.cipher.encrypt(&nonce, plaintext)
+        self.cipher.encrypt_in_place(&nonce, buf)
     }
 
-    fn decrypt_chunk(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_in_place<B: AeadBuffer>(&mut self, buf: &mut B) -> Result<()> {
         let nonce = self.next_nonce();
-        self.cipher.decrypt(&nonce, ciphertext)
+        self.cipher.decrypt_in_place(&nonce, buf)
     }
 
     fn mask_len(&mut self, len: u16) -> u16 {
@@ -783,6 +871,7 @@ impl VmessConnection {
         security: ResolvedSecurity,
         address: Address,
         port: u16,
+        time_offset_secs: i64,
     ) -> Result<Self> {
         if !security.is_aead() {
             return Err(Error::unsupported(
@@ -814,11 +903,14 @@ impl VmessConnection {
             padding_len,
         )?;
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        debug!(protocol = "vmess", phase = "timestamp", ts = timestamp, "generated");
+        let timestamp = vmess_timestamp_secs(time_offset_secs);
+        debug!(
+            protocol = "vmess",
+            phase = "timestamp",
+            ts = timestamp,
+            offset_secs = time_offset_secs,
+            "generated"
+        );
         let auth_id = create_auth_id(&cmd_key, timestamp);
 
         let mut connection_nonce = [0u8; 8];
@@ -1032,9 +1124,9 @@ impl VmessConnection {
                 break;
             }
 
-            let ciphertext = self.read_buf.split_to(payload_len);
-            let plaintext = self.dec.decrypt_chunk(&ciphertext)?;
-            self.pending_plain.put_slice(&plaintext);
+            let mut ciphertext = self.read_buf.split_to(payload_len);
+            self.dec.decrypt_in_place(&mut ciphertext)?;
+            self.pending_plain.extend_from_slice(ciphertext.as_ref());
             self.dec_pending_len = None;
             produced = true;
         }
@@ -1169,19 +1261,31 @@ impl AsyncWrite for VmessConnection {
         let this = self.as_mut().get_mut();
         if !buf.is_empty() {
             for chunk in buf.chunks(WRITE_CHUNK_SIZE) {
-                let ciphertext = match this.enc.encrypt_chunk(chunk) {
-                    Ok(c) => c,
-                    Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
-                };
+                this.write_buf
+                    .reserve(2 + chunk.len() + this.enc.cipher.overhead());
 
-                if ciphertext.len() > u16::MAX as usize {
+                let len_pos = this.write_buf.len();
+                this.write_buf.put_u16(0);
+
+                let payload_start = this.write_buf.len();
+                this.write_buf.put_slice(chunk);
+
+                {
+                    let mut tail = TailBuffer::new(&mut this.write_buf, payload_start);
+                    if let Err(e) = this.enc.encrypt_in_place(&mut tail) {
+                        return Poll::Ready(Err(io::Error::other(e.to_string())));
+                    }
+                }
+
+                let payload_len = this.write_buf.len() - payload_start;
+                if payload_len > u16::MAX as usize {
                     return Poll::Ready(Err(io::Error::other("vmess chunk too large")));
                 }
-                let mut len = ciphertext.len() as u16;
-                len = this.enc.mask_len(len);
 
-                this.write_buf.put_u16(len);
-                this.write_buf.put_slice(&ciphertext);
+                let mut len = payload_len as u16;
+                len = this.enc.mask_len(len);
+                this.write_buf[len_pos] = (len >> 8) as u8;
+                this.write_buf[len_pos + 1] = (len & 0xff) as u8;
             }
         }
 
@@ -1216,6 +1320,177 @@ impl AsyncWrite for VmessConnection {
 mod tests {
     use super::*;
 
+    mod kdf_ref {
+        use super::*;
+
+        trait DynHash: Send + Sync {
+            fn update(&mut self, data: &[u8]);
+            fn finalize(self: Box<Self>) -> Vec<u8>;
+            fn block_size(&self) -> usize;
+            fn output_size(&self) -> usize;
+        }
+
+        trait DynHashFactory: Send + Sync {
+            fn create(&self) -> Box<dyn DynHash>;
+            fn block_size(&self) -> usize;
+            fn output_size(&self) -> usize;
+        }
+
+        struct Sha256Factory;
+
+        impl DynHashFactory for Sha256Factory {
+            fn create(&self) -> Box<dyn DynHash> {
+                Box::new(Sha256Hash {
+                    hasher: Sha256::new(),
+                })
+            }
+
+            fn block_size(&self) -> usize {
+                64
+            }
+
+            fn output_size(&self) -> usize {
+                32
+            }
+        }
+
+        struct Sha256Hash {
+            hasher: Sha256,
+        }
+
+        impl DynHash for Sha256Hash {
+            fn update(&mut self, data: &[u8]) {
+                Sha2Digest::update(&mut self.hasher, data);
+            }
+
+            fn finalize(self: Box<Self>) -> Vec<u8> {
+                let Sha256Hash { hasher } = *self;
+                hasher.finalize().to_vec()
+            }
+
+            fn block_size(&self) -> usize {
+                64
+            }
+
+            fn output_size(&self) -> usize {
+                32
+            }
+        }
+
+        struct HmacFactory {
+            key: Vec<u8>,
+            inner: Arc<dyn DynHashFactory>,
+        }
+
+        impl HmacFactory {
+            fn new(key: &[u8], inner: Arc<dyn DynHashFactory>) -> Self {
+                Self {
+                    key: key.to_vec(),
+                    inner,
+                }
+            }
+        }
+
+        impl DynHashFactory for HmacFactory {
+            fn create(&self) -> Box<dyn DynHash> {
+                Box::new(DynHmac::new(self.key.clone(), self.inner.clone()))
+            }
+
+            fn block_size(&self) -> usize {
+                self.inner.block_size()
+            }
+
+            fn output_size(&self) -> usize {
+                self.inner.output_size()
+            }
+        }
+
+        struct DynHmac {
+            inner_factory: Arc<dyn DynHashFactory>,
+            inner: Box<dyn DynHash>,
+            opad: Vec<u8>,
+        }
+
+        impl DynHmac {
+            fn new(key: Vec<u8>, inner_factory: Arc<dyn DynHashFactory>) -> Self {
+                let block_size = inner_factory.block_size();
+                let key = if key.len() > block_size {
+                    let mut h = inner_factory.create();
+                    h.update(&key);
+                    h.finalize()
+                } else {
+                    key
+                };
+
+                let mut key_block = vec![0u8; block_size];
+                key_block[..key.len()].copy_from_slice(&key);
+
+                let mut ipad = key_block.clone();
+                for b in &mut ipad {
+                    *b ^= 0x36;
+                }
+
+                let mut opad = key_block;
+                for b in &mut opad {
+                    *b ^= 0x5c;
+                }
+
+                let mut inner = inner_factory.create();
+                inner.update(&ipad);
+
+                Self {
+                    inner_factory,
+                    inner,
+                    opad,
+                }
+            }
+        }
+
+        impl DynHash for DynHmac {
+            fn update(&mut self, data: &[u8]) {
+                self.inner.update(data);
+            }
+
+            fn finalize(self: Box<Self>) -> Vec<u8> {
+                let DynHmac {
+                    inner_factory,
+                    inner,
+                    opad,
+                } = *self;
+
+                let inner_sum = inner.finalize();
+
+                let mut outer = inner_factory.create();
+                outer.update(&opad);
+                outer.update(&inner_sum);
+                outer.finalize()
+            }
+
+            fn block_size(&self) -> usize {
+                self.inner_factory.block_size()
+            }
+
+            fn output_size(&self) -> usize {
+                self.inner_factory.output_size()
+            }
+        }
+
+        pub(super) fn vmess_kdf_reference(key: &[u8], salt: &[u8], path: &[&[u8]]) -> [u8; 32] {
+            let mut factory: Arc<dyn DynHashFactory> =
+                Arc::new(HmacFactory::new(KDF_ROOT, Arc::new(Sha256Factory)));
+            factory = Arc::new(HmacFactory::new(salt, factory));
+            for p in path {
+                factory = Arc::new(HmacFactory::new(p, factory));
+            }
+
+            let mut h = factory.create();
+            h.update(key);
+            let out = h.finalize();
+            out.try_into()
+                .unwrap_or_else(|_| unreachable!("sha256 output size mismatch"))
+        }
+    }
+
     #[test]
     fn test_vmess_security() {
         assert_eq!(
@@ -1242,5 +1517,40 @@ mod tests {
     fn test_kdf_output_len() {
         let out = vmess_kdf(&[0u8; 16], b"test", &[b"path"]);
         assert_eq!(out.len(), 32);
+    }
+
+    #[test]
+    fn test_kdf_matches_reference() {
+        let key = [0x42u8; 16];
+        let salt = b"test-salt";
+        let p1 = b"path-1";
+        let p2 = b"path-2";
+
+        let cases: Vec<Vec<&[u8]>> = vec![vec![], vec![p1.as_ref()], vec![p1.as_ref(), p2.as_ref()]];
+        for path in cases {
+            let got = vmess_kdf(&key, salt, &path);
+            let exp = kdf_ref::vmess_kdf_reference(&key, salt, &path);
+            assert_eq!(got, exp);
+        }
+
+        let long_salt = vec![0x11u8; 100];
+        let long_path = vec![0x22u8; 100];
+        let path = vec![long_path.as_slice()];
+        let got = vmess_kdf(&key, &long_salt, &path);
+        let exp = kdf_ref::vmess_kdf_reference(&key, &long_salt, &path);
+        assert_eq!(got, exp);
+    }
+
+    #[test]
+    fn test_body_cipher_roundtrip_aes128_gcm() {
+        let key16 = [7u8; 16];
+        let nonce = [1u8; 12];
+        let cipher = VmessBodyCipher::Aes128Gcm(Aes128Gcm::new_from_slice(&key16).unwrap());
+
+        let mut buf = BytesMut::from(&b"hello vmess"[..]);
+        cipher.encrypt_in_place(&nonce, &mut buf).unwrap();
+        assert_ne!(buf.as_ref(), b"hello vmess");
+        cipher.decrypt_in_place(&nonce, &mut buf).unwrap();
+        assert_eq!(buf.as_ref(), b"hello vmess");
     }
 }
