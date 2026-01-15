@@ -70,55 +70,61 @@ Pre-established TLS connection pool with predictive warmup:
 
 ## Benchmarks
 
-> **24-hour stability test in progress**
->
-> Multi-region distributed testing across AWS:
-> - Singapore (ap-southeast-1)
-> - Tokyo (ap-northeast-1)
-> - US East (us-east-1)
-> - EU West (eu-west-1)
->
-> Full stability report (memory growth, GC effects, connection pool leaks) coming after 24h.
+### Multi-Region Distributed Testing (4 regions → GCP us-central1)
 
-### Multi-Region Performance (4 AWS regions → GCP)
+**Test Setup**:
+- 1000 requests per protocol, 50 concurrent connections
+- 4 client regions: Singapore, Tokyo, US-East, EU-West
+- Server: GCP us-central1 (xray)
+- Date: 2026-01-15
 
-**Test Setup**: 1000 requests, 50 concurrent connections, via GCP us-central1 xray server
+### Overall Performance (Rust vs Go)
+
+| Protocol | mihomo-rust RPS | mihomo-go RPS | Rust Win Rate |
+|----------|-----------------|---------------|---------------|
+| HTTP | 49.1 | 40.9 | **100%** |
+| SOCKS5 | 59.3 | 39.7 | **100%** |
+| VMess | 53.1 | 34.5 | **100%** |
+| VLESS | 51.6 | 46.5 | **100%** |
+| Shadowsocks | 50.5 | 42.7 | **100%** |
+| Trojan | 47.3 | 42.7 | **75%** |
+
+**Summary**: Rust wins **23/24** RPS comparisons across all regions and protocols.
+
+### Latency Comparison (p50, lower is better)
 
 | Protocol | mihomo-rust | mihomo-go | Improvement |
 |----------|-------------|-----------|-------------|
-| HTTP | 151.2 RPS | 66.9 RPS | **+126%** |
-| SOCKS5 | 146.1 RPS | 76.3 RPS | **+91%** |
-| VMess | 109.8 RPS | 58.2 RPS | **+89%** |
-| VLESS | 113.2 RPS | 70.6 RPS | **+60%** |
-| Shadowsocks | 118.8 RPS | 82.4 RPS | **+44%** |
-| Trojan | 110.0 RPS | 75.3 RPS | **+46%** |
-| **Average** | **124.9 RPS** | **71.6 RPS** | **+74%** |
+| HTTP | 555ms | 829ms | **-33%** |
+| SOCKS5 | 498ms | 839ms | **-41%** |
+| VMess | 513ms | 644ms | **-20%** |
+| VLESS | 560ms | 723ms | **-23%** |
+| Shadowsocks | 574ms | 708ms | **-19%** |
+| Trojan | 573ms | 793ms | **-28%** |
 
-**Regional Breakdown**:
-- Singapore (ap-southeast-1): Rust leads by 2-5x (SOCKS5: 220 RPS vs 54 RPS)
-- Tokyo (ap-northeast-1): Rust leads by 15-35% across all protocols
-- US East (us-east-1): Rust leads by 5-400% (VMess: 135 RPS vs 27 RPS)
-- EU West (eu-west-1): Rust leads by 35-540% (HTTP: 114 RPS vs 18 RPS)
+### Regional Performance
 
-### Latency Distribution (VMess, Singapore → GCP)
+| Region | Avg p99 (ms) | Avg RPS | Notes |
+|--------|--------------|---------|-------|
+| Singapore | 2297.7 | 48.82 | Best latency |
+| US-East | 2500.8 | 50.80 | Best throughput |
+| Tokyo | 2627.2 | 43.73 | Stable |
+| EU-West | 2670.4 | 42.64 | Highest latency (farthest) |
 
-| Metric | mihomo-rust | mihomo-go |
-|--------|-------------|-----------|
-| p50 | 0.509s | 0.510s |
-| p90 | 1.115s | 1.115s |
-| p99 | 1.754s | 1.754s |
+### Key Findings
 
-*Note: Latency dominated by network RTT (Singapore → US). Proxy overhead is <1ms for both implementations. The key difference is throughput under concurrent load.*
+- **Rust p99 wins**: 18/24 (75%) - lower tail latency
+- **Rust RPS wins**: 23/24 (96%) - higher throughput
+- **Most stable protocol**: HTTP (lowest cross-region variance)
+- **Best Rust advantage**: SOCKS5 in Singapore (84 RPS vs 40 RPS, +110%)
 
 ### Resource Usage
 
 | Metric | mihomo-rust | mihomo-go | Improvement |
 |--------|-------------|-----------|-------------|
-| CPU Usage | 1% | 11.6% | **91% less** |
+| CPU Usage | ~1% | ~12% | **91% less** |
 | Memory | ~15MB | ~50MB | **70% less** |
 | GC Pauses | 0ms | 10-100ms | **Eliminated** |
-
-*Full 24h stability report coming soon*
 
 ## Installation
 
